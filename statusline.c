@@ -210,7 +210,7 @@ static char *pystr(struct json_object *o)
 	}
 }
 
-/*Status line*/
+//Status line
 
 static char *col(int code, const char *s)
 {
@@ -247,7 +247,7 @@ static int pct(struct json_object *o, double *out)
 	return 1;
 }
 
-/*Green under 60%, yellow from 60%, red from 80%.*/
+//Green under 60%, yellow from 60%, red from 80%
 static int colour_for(double p)
 {
 	return p < 60 ? 32 : (p < 80 ? 33 : 31);

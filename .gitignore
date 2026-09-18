@@ -1,0 +1,5 @@
+# Build products; `make` rebuilds them from the sources beside them.
+/statusline
+/statusline-nodeps
+
+__pycache__/

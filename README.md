@@ -2,10 +2,11 @@
 
 A status line for [Claude Code](https://claude.com/claude-code): one ANSI-coloured
 line showing the model, a context-window meter, the 5-hour / 7-day / spend rate
-limits with their reset times, session cost, and the current directory.
+limits with their reset times, a ration bar for the weekly quota, session cost,
+and the current directory.
 
 ```
-Opus 5 │ ▰▰▰▱▱▱▱▱▱▱ 28% 62k/220k │ 5h 41%↺3h │ 7d 12%↺5d │ $1.84 │ statusline
+Opus 5 │ ▰▰▰▱▱▱▱▱▱▱ 28% 62k/220k │ 5h 41%↺3h │ 7d ▰▰▰▰▱▱▱▱▱▱ 38%↺56h │ $1.84 │ statusline
 ```
 
 Claude Code runs the configured status-line command on every render, passing a
@@ -67,10 +68,28 @@ session with no rate-limit data simply shows fewer segments.
 | model | `model.display_name` | plus `fast` and the effort level when set |
 | context meter | `context_window.{total_input_tokens,context_window_size}` | 10-cell bar, percentage, used/total |
 | `5h` / `7d` / `spend` | `rate_limits.*.used_percentage`, `.resets_at` | `↺` is the time until reset |
+| ration bar | `rate_limits.seven_day.{used_percentage,resets_at}` | on the `7d` segment; see below |
 | cost | `cost.total_cost_usd` | shown only when above zero |
 | directory | `workspace.current_dir`, else `cwd` | last path segment |
 
-The bar and the percentages are green under 60%, yellow from 60%, red from 80%.
+The context bar and the percentages are green under 60%, yellow from 60%, red
+from 80%.
+
+### The ration bar
+
+The weekly quota resets Saturday 07:00 America/Chicago, and an even burn would
+by now have used the fraction of the week that has elapsed — the same schedule
+as `~/Scripts/C/token.rationing.c`. The bar on the `7d` segment compares the
+two:
+
+- **under pace** — the used cells are green, and the cells between them and the
+  on-pace budget are bold green `▱`: ration to spare.
+- **over pace** — the cells up to the budget are red, and the cells past it are
+  bold red `▰`: ration over-used.
+
+The window's start is found in Chicago wall-clock, so the two weeks a year that
+cross a DST change are 167 and 169 hours rather than 168. `resets_at` arrives as
+a Unix time; without it there is no bar and no `↺`.
 
 ## Tests
 
@@ -84,15 +103,24 @@ byte.
 make test                   # checks ./statusline
 make test-nodeps            # checks ./statusline-nodeps
 make test FUZZ=20000        # more randomised payloads (default 3000)
+make valgrind               # every curated payload under valgrind
+make valgrind-nodeps
 ```
 
-Needs `python3`. The handful of inputs where the C deliberately diverges from
+`statusline-test.sh` pins one clock for the whole run through `STATUSLINE_NOW`,
+which both implementations read in place of the time, so the two are compared
+at the same instant. `statusline-test-pace.py` checks the ration bar against
+hand-worked windows on fixed clocks, including both DST weeks. The valgrind run
+fails on any leak of any kind, "still reachable" included: both builds free
+everything before exiting.
+
+Needs `python3`; the memory check also needs `valgrind`. The handful of inputs where the C deliberately diverges from
 the Python — all of them malformed, none emitted by Claude Code — are listed in
 the header comment of `statusline.c`.
 
 ## Keeping it current
 
-The payload shape was read off the Claude Code 2.1.276 binary. After an upgrade,
-run `make test`, then check the line against `/context` and `/usage` in a live
-session; `echo '{}' | ~/.claude/statusline` should print an empty line rather
-than an error.
+The payload shape was read off the Claude Code 2.1.276 binary, and the numeric
+`resets_at` off 2.1.281. After an upgrade, run `make test`, then check the line
+against `/context` and `/usage` in a live session; `echo '{}' |
+~/.claude/statusline` should print an empty line rather than an error.

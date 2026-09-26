@@ -9,11 +9,12 @@ spend_limit}.{used_percentage,resets_at}. In 2.1.281 (function jjn) resets_at is
 the rate-limit window's own resets_at, a Unix time in seconds; an ISO-8601
 string is still accepted.
 
-The 7d segment carries a ration bar, after ~/Scripts/C/token.rationing.c: the
-weekly quota resets Saturday 07:00 America/Chicago, per the account's stated
+The 7d segment is rationed, after ~/Scripts/C/token.rationing.c: the weekly
+quota resets Saturday 07:00 America/Chicago, per the account's stated
 weekly-limit reset, and an even burn would by now have spent the fraction of the
-window already elapsed. The bar shows consumption against that on-pace budget,
-green with ration to spare and red once it is over-used.
+window already elapsed. The segment shows consumption and that on-pace budget as
+two percentages to one decimal, "7d 12.3%/15.0%", green at or under pace and red
+once over it.
 
 STATUSLINE_NOW, a Unix time, stands in for the clock; statusline-test.sh sets it
 so that this and the C read the same instant.
@@ -72,19 +73,6 @@ def cells(p, width):
 def bar(p, width=10):
 	filled = cells(p, width)
 	return c(colour_for(p), "▰" * filled) + c(90, "▱" * (width - filled))
-
-
-def pace_bar(used, sched, width=10):
-	"""Consumption against the on-pace budget, both as percentages.
-
-	Under or exactly on pace, the consumed cells are green and the cells up to
-	the budget are bold green: ration to spare. Over it, the cells up to the
-	budget are red and the ones past it bold red: ration over-used. Exactly on
-	pace counts as under, so an untouched quota is never red."""
-	u, s = cells(used, width), cells(sched, width)
-	if used > sched:
-		return c(31, "▰" * s) + c("1;31", "▰" * (u - s)) + c(90, "▱" * (width - u))
-	return c(32, "▰" * u) + c("1;32", "▱" * (s - u)) + c(90, "▱" * (width - s))
 
 
 def human(n):
@@ -184,7 +172,10 @@ def main():
 		sched = week_elapsed(end) if key == "seven_day" and end is not None else None
 		tail = c(90, f"↺{left}") if left else ""
 		if sched is not None and math.isfinite(p):
-			parts.append(f"{c(colour_for(p), short)} {pace_bar(p, sched)} {c(colour_for(p), f'{p:.0f}%')}{tail}")
+			# Exactly on pace counts as under, so an untouched quota is never red.
+			# The colour is decided before rounding, so 15.04 against 14.96 is red
+			# although both print as 15.0.
+			parts.append(c(31 if p > sched else 32, f"{short} {p:.1f}%/{sched:.1f}%") + tail)
 		else:
 			parts.append(c(colour_for(p), f"{short} {p:.0f}%") + tail)
 

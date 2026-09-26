@@ -88,7 +88,7 @@ cases = [
 	rl(used_percentage=42, resets_at=True),
 	rl(used_percentage=42, resets_at=1e300),
 	rl(used_percentage=42, resets_at=[1]),
-	# the 7d ration bar: under, on and over pace, early and late in the week
+	# the 7d ration: under, on and over pace, early and late in the week
 	wk(0, 167.9), wk(0, 84), wk(0, 0.1), wk(50, 84), wk(49, 84), wk(51, 84),
 	wk(5, 150), wk(30, 150), wk(90, 150), wk(5, 50), wk(30, 50), wk(90, 50),
 	wk(100, 1), wk(120, 1), wk(-5, 100), wk(35.7, 100), wk(45.9, 100),

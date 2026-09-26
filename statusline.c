@@ -8,11 +8,12 @@ spend_limit}.{used_percentage,resets_at}. In 2.1.281 (function jjn) resets_at is
 the rate-limit window's own resets_at, a Unix time in seconds; an ISO-8601
 string is still accepted.
 
-The 7d segment carries a ration bar, after ~/Scripts/C/token.rationing.c: the
-weekly quota resets Saturday 07:00 America/Chicago, per the account's stated
+The 7d segment is rationed, after ~/Scripts/C/token.rationing.c: the weekly
+quota resets Saturday 07:00 America/Chicago, per the account's stated
 weekly-limit reset, and an even burn would by now have spent the fraction of the
-window already elapsed. The bar shows consumption against that on-pace budget,
-green with ration to spare and red once it is over-used.
+window already elapsed. The segment shows consumption and that on-pace budget as
+two percentages to one decimal, "7d 12.3%/15.0%", green at or under pace and red
+once over it.
 
 A translation of statusline.py, which stays the readable reference; behaviour is
 meant to match it field for field, and statusline-test.sh checks that it does.
@@ -98,7 +99,9 @@ static void sreserve(sbuf *b, size_t n)
 	}
 }
 
-static void sput(sbuf *b, const char *s, size_t n)
+/*s never points into b->p, which may move under sreserve(); restrict lets the
+compiler keep b->len and b->p in registers across the memcpy.*/
+static void sput(sbuf *restrict b, const char *restrict s, size_t n)
 {
 	sreserve(b, n);
 	memcpy(b->p + b->len, s, n);
@@ -106,14 +109,14 @@ static void sput(sbuf *b, const char *s, size_t n)
 	b->p[b->len] = '\0';
 }
 
-static void sputs(sbuf *b, const char *s)
+static void sputs(sbuf *restrict b, const char *restrict s)
 {
 	sput(b, s, strlen(s));
 }
 
 /*printf onto the end of b. No argument may point into b itself: the buffer can
 move when it grows.*/
-static void sappf(sbuf *b, const char *fmt, ...)
+static void sappf(sbuf *restrict b, const char *restrict fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -342,27 +345,6 @@ static void bar(sbuf *b, double p)
 	int filled = cells(p);
 	srun(b, colour_for(p), BAR_FULL, filled);
 	srun(b, "90", BAR_EMPTY, BAR_WIDTH - filled);
-}
-
-/*Consumption against the on-pace budget, both as percentages.
-
-Under or exactly on pace, the consumed cells are green and the cells up to the
-budget are bold green: ration to spare. Over it, the cells up to the budget are
-red and the ones past it bold red: ration over-used. Exactly on pace counts as
-under, so an untouched quota is never red. cells() is monotonic, so u >= s
-exactly when used > sched and neither run below goes negative.*/
-static void pace_bar(sbuf *b, double used, double sched)
-{
-	int u = cells(used), s = cells(sched);
-	if (used > sched) {
-		srun(b, "31", BAR_FULL, s);
-		srun(b, "1;31", BAR_FULL, u - s);
-		srun(b, "90", BAR_EMPTY, BAR_WIDTH - u);
-	} else {
-		srun(b, "32", BAR_FULL, u);
-		srun(b, "1;32", BAR_EMPTY, s - u);
-		srun(b, "90", BAR_EMPTY, BAR_WIDTH - s);
-	}
 }
 
 static void human(sbuf *b, long long n)
@@ -710,16 +692,15 @@ int main(void)
 		int have_end = reset_time(jget(v, "resets_at"), &end);
 
 		part(&out, &np);
-		/*Only the weekly window is rationed; a NaN or infinite percentage has
-		no place on a bar, and the Python's round() raises on one.*/
+		/*Only the weekly window is rationed, and a NaN or infinite percentage
+		cannot be measured against a pace.*/
 		if (tz_ok && have_end && strcmp(keys[i], "seven_day") == 0 && isfinite(p)
 		    && week_elapsed(end, now, &sched)) {
-			scol(&out, hue, shorts[i]);
-			sputs(&out, " ");
-			pace_bar(&out, p, sched);
-			sputs(&out, " ");
-			sopen(&out, hue);
-			sappf(&out, "%.0f%%" RESET, p);
+			/*Exactly on pace counts as under, so an untouched quota is never
+			red. The colour is decided before rounding, so 15.04 against 14.96
+			is red although both print as 15.0.*/
+			sopen(&out, p > sched ? "31" : "32");
+			sappf(&out, "%s %.1f%%/%.1f%%" RESET, shorts[i], p, sched);
 		} else {
 			sopen(&out, hue);
 			sappf(&out, "%s %.0f%%" RESET, shorts[i], p);

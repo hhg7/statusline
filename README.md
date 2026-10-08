@@ -60,8 +60,9 @@ test suite.
 
 ## What it shows
 
-Each segment is dropped when the payload does not carry its field, so a fresh
-session with no rate-limit data simply shows fewer segments.
+Each segment is dropped when the payload does not carry its field. The one
+exception is the rate limits, which a fresh session would otherwise lack; see
+below.
 
 | Segment | Source field | Notes |
 | --- | --- | --- |
@@ -90,6 +91,23 @@ cross a DST change are 167 and 169 hours rather than 168. `resets_at` arrives as
 a Unix time; without it the segment shows only the consumed percentage,
 coloured by the 60%/80% thresholds, and no `↺`.
 
+### At startup
+
+Claude Code sends no `rate_limits` until the first API reply of a session, so
+on its own the line would start without `5h`, `7d` or the ration. Every payload
+that does carry `rate_limits` is therefore saved whole, and a payload without
+them borrows the saved ones. A saved window whose reset has passed is left out,
+as is one with no `resets_at` to age it by, so what shows at startup is the
+last reading of each window that is still current. It is replaced by live
+figures as soon as the first reply arrives, and usage elsewhere in the
+meantime (another machine, claude.ai) is not reflected until then.
+
+The file is `$XDG_CACHE_HOME/claude-statusline.json`, or
+`~/.cache/claude-statusline.json` when that is unset, written mode 0600 and
+replaced by rename so that concurrent sessions never see half a file.
+`STATUSLINE_CACHE` names another file; set to the empty string it turns the
+cache off.
+
 ## Tests
 
 `statusline.py` is the reference implementation: readable, and the thing the C
@@ -109,7 +127,9 @@ make valgrind-nodeps
 `statusline-test.sh` pins one clock for the whole run through `STATUSLINE_NOW`,
 which both implementations read in place of the time, so the two are compared
 at the same instant. `statusline-test-pace.py` checks the ration against
-hand-worked windows on fixed clocks, including both DST weeks. The valgrind run
+hand-worked windows on fixed clocks, including both DST weeks. The differential
+run turns the cache off; `statusline-test-cache.py` checks it in temporary
+directories, including a cache written by one build and read by the other. The valgrind run
 fails on any leak of any kind, "still reachable" included: both builds free
 everything before exiting.
 

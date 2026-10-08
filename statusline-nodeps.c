@@ -15,6 +15,15 @@ window already elapsed. The segment shows consumption and that on-pace budget as
 two percentages to one decimal, "7d 12.3%/15.0%", green at or under pace and red
 once over it.
 
+A fresh session's payload carries no rate_limits until the first API reply
+comes back, so the usage segments would be missing at startup. Every payload
+that does carry them is saved whole to a cache file, and a payload without them
+borrows the cached rate_limits instead. A cached window whose reset has passed,
+or that has no reset time to age it by, is left out: its percentage no longer
+describes anything. The file is $STATUSLINE_CACHE, else
+$XDG_CACHE_HOME/claude-statusline.json, else ~/.cache/claude-statusline.json;
+STATUSLINE_CACHE set but empty turns the cache off, which the tests rely on.
+
 A translation of statusline.py with no dependency beyond libc, kept as the
 fallback for a machine without json-c; statusline.c is the maintained version
 and links against json-c instead. STATUSLINE_NOW, a Unix time, stands in for
@@ -29,9 +38,10 @@ in-session. `make valgrind-nodeps` checks that every allocation is freed.
 There is no JSON parser in the C library and none installed here, so one is
 hand-rolled below -- it also keeps the binary free of shared-library deps.*/
 
-#define _DEFAULT_SOURCE   /*for timegm() and tm_gmtoff, which are not in C11*/
+#define _DEFAULT_SOURCE   /*for timegm(), tm_gmtoff and the POSIX file calls, which are not in C11*/
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -39,6 +49,7 @@ hand-rolled below -- it also keeps the binary free of shared-library deps.*/
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define RESET "\033[0m"
 
@@ -117,6 +128,17 @@ static void sfree(sbuf *b)
 	free(b->p);
 	b->p = NULL;
 	b->len = b->cap = 0;
+}
+
+/*Append everything left in f; 0 if a read error cut it short.*/
+static int sslurp(sbuf *b, FILE *f)
+{
+	char chunk[4096];
+	size_t got;
+	sput(b, "", 0);
+	while ((got = fread(chunk, 1, sizeof chunk, f)) > 0)
+		sput(b, chunk, got);
+	return !ferror(f);
 }
 
 /*JSON value tree*/
@@ -920,6 +942,79 @@ static int week_elapsed(double end, double now, double *out)
 	return 1;
 }
 
+/*Path of the rate-limit cache into b, 1 on success; 0 means no cache.*/
+static int cache_path(sbuf *b)
+{
+	const char *env = getenv("STATUSLINE_CACHE");
+	if (env) {
+		if (!*env)
+			return 0;
+		sputs(b, env);
+		return 1;
+	}
+	const char *base = getenv("XDG_CACHE_HOME");
+	if (base && base[0] == '/') {   /*the XDG spec says a relative value is ignored*/
+		sputs(b, base);
+	} else {
+		const char *home = getenv("HOME");
+		if (!home || !*home)
+			return 0;
+		sputs(b, home);
+		sputs(b, "/.cache");
+	}
+	sputs(b, "/claude-statusline.json");
+	return 1;
+}
+
+/*The cached payload, or JNULL if there is none. Released with jfree().*/
+static jval *cache_read(const char *path)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return &jnull;
+	sbuf text = { NULL, 0, 0 };
+	int ok = sslurp(&text, f);
+	fclose(f);
+	jval *d = ok ? jparse(text.p) : &jnull;
+	sfree(&text);
+	return d;
+}
+
+/*Replace the cache with text, through a rename so that a concurrent session
+never reads half a file. Unchanged contents are not rewritten, since this runs
+on every render. Failure is silent: the cache is a convenience.*/
+static void cache_write(const char *path, const char *text, size_t len)
+{
+	FILE *f = fopen(path, "rb");
+	if (f) {
+		sbuf old = { NULL, 0, 0 };
+		int same = sslurp(&old, f) && old.len == len && memcmp(old.p, text, len) == 0;
+		fclose(f);
+		sfree(&old);
+		if (same)
+			return;
+	}
+
+	sbuf tmp = { NULL, 0, 0 };
+	sappf(&tmp, "%s.%ld.tmp", path, (long)getpid());
+	int fd = open(tmp.p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd >= 0) {
+		int ok = 1;
+		for (size_t done = 0; ok && done < len; ) {
+			ssize_t w = write(fd, text + done, len - done);
+			if (w < 0)
+				ok = 0;
+			else
+				done += (size_t)w;
+		}
+		if (close(fd) != 0)
+			ok = 0;
+		if (!ok || rename(tmp.p, path) != 0)
+			unlink(tmp.p);
+	}
+	sfree(&tmp);
+}
+
 /*time.time(), or STATUSLINE_NOW when the test sets it.*/
 static double now_unix(void)
 {
@@ -934,15 +1029,11 @@ static double now_unix(void)
 
 int main(void)
 {
+	/*The raw text is kept, not just the parse, because it is what the cache
+	stores.*/
 	sbuf in = { NULL, 0, 0 };
-	sput(&in, "", 0);
-	char chunk[4096];
-	size_t got;
-	while ((got = fread(chunk, 1, sizeof chunk, stdin)) > 0)
-		sput(&in, chunk, got);
-
+	sslurp(&in, stdin);
 	jval *d = jparse(in.p);
-	sfree(&in);
 
 	double now = now_unix();
 	/*Pin the zone for utcoffset(): the reset is Chicago wall-clock, whatever TZ
@@ -1000,6 +1091,18 @@ int main(void)
 	}
 
 	jval *rl = jget(d, "rate_limits");
+	jval *cache = NULL;   // the cached payload, when rl is borrowed from it
+	sbuf path = { NULL, 0, 0 };
+	if (cache_path(&path)) {
+		if (rl->type == JOBJ && jtruthy(rl)) {
+			cache_write(path.p, in.p, in.len);
+		} else if (!jtruthy(rl)) {
+			cache = cache_read(path.p);
+			rl = jget(cache, "rate_limits");
+		}
+	}
+	sfree(&path);
+	sfree(&in);
 	static const char *keys[] = { "five_hour", "seven_day", "spend_limit" };
 	static const char *shorts[] = { "5h", "7d", "spend" };
 	for (int i = 0; i < 3; i++) {
@@ -1012,6 +1115,8 @@ int main(void)
 		const char *hue = colour_for(p);
 		double end = 0, sched = 0;   /*set only on success; zeroed for -Wmaybe-uninitialized*/
 		int have_end = reset_time(jget(v, "resets_at"), &end);
+		if (cache && (!have_end || end <= now))
+			continue;
 
 		part(&out, &np);
 		/*Only the weekly window is rationed, and a NaN or infinite percentage
@@ -1065,6 +1170,7 @@ int main(void)
 	sputs(&out, "\n");
 	fputs(out.p, stdout);
 	sfree(&out);
+	jfree(cache);
 	jfree(d);
 	return 0;
 }

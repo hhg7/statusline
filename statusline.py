@@ -16,6 +16,15 @@ window already elapsed. The segment shows consumption and that on-pace budget as
 two percentages to one decimal, "7d 12.3%/15.0%", green at or under pace and red
 once over it.
 
+A fresh session's payload carries no rate_limits until the first API reply
+comes back, so the usage segments would be missing at startup. Every payload
+that does carry them is saved whole to a cache file, and a payload without them
+borrows the cached rate_limits instead. A cached window whose reset has passed,
+or that has no reset time to age it by, is left out: its percentage no longer
+describes anything. The file is $STATUSLINE_CACHE, else
+$XDG_CACHE_HOME/claude-statusline.json, else ~/.cache/claude-statusline.json;
+STATUSLINE_CACHE set but empty turns the cache off, which the tests rely on.
+
 STATUSLINE_NOW, a Unix time, stands in for the clock; statusline-test.sh sets it
 so that this and the C read the same instant.
 
@@ -133,9 +142,58 @@ def week_elapsed(end):
 	return max(0.0, min(100.0, (NOW - start) / (end - start) * 100))
 
 
-def main():
+def cache_path():
+	"""Where the last payload with rate_limits is kept, or None for no cache."""
+	if "STATUSLINE_CACHE" in os.environ:
+		return os.environ["STATUSLINE_CACHE"] or None
+	base = os.environ.get("XDG_CACHE_HOME", "")
+	if not base.startswith("/"):   # the XDG spec says a relative value is ignored
+		home = os.environ.get("HOME")
+		if not home:
+			return None
+		base = home + "/.cache"
+	return base + "/claude-statusline.json"
+
+
+def cache_read(path):
+	"""The rate_limits of the cached payload, or {} if there is none."""
 	try:
-		d = json.load(sys.stdin)
+		with open(path, encoding="utf-8") as f:
+			d = json.load(f)
+	except (OSError, ValueError):
+		return {}
+	rl = d.get("rate_limits") if isinstance(d, dict) else None
+	return rl if isinstance(rl, dict) else {}
+
+
+def cache_write(path, text):
+	"""Replace the cache with text, through a rename so that a concurrent
+	session never reads half a file. Unchanged contents are not rewritten, since
+	this runs on every render. Failure is silent: the cache is a convenience."""
+	try:
+		with open(path, encoding="utf-8") as f:
+			if f.read() == text:
+				return
+	except (OSError, ValueError):
+		pass
+	tmp = f"{path}.{os.getpid()}.tmp"
+	try:
+		fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+		with os.fdopen(fd, "w", encoding="utf-8") as f:
+			f.write(text)
+		os.rename(tmp, path)
+	except OSError:
+		try:
+			os.unlink(tmp)
+		except OSError:
+			pass
+
+
+def main():
+	text = None
+	try:
+		text = sys.stdin.read()
+		d = json.loads(text)
 	except (json.JSONDecodeError, ValueError):
 		d = {}
 
@@ -160,6 +218,14 @@ def main():
 		parts.append(f"{bar(p)} {c(colour_for(p), f'{p:.0f}%')} {c(90, f'{human(int(used))}/{human(int(size))}')}")
 
 	rl = d.get("rate_limits") or {}
+	cached = False
+	path = cache_path()
+	if path:
+		if isinstance(rl, dict) and rl:
+			cache_write(path, text)
+		elif not rl:
+			rl = cache_read(path)
+			cached = True
 	for key, short in (("five_hour", "5h"), ("seven_day", "7d"), ("spend_limit", "spend")):
 		v = rl.get(key)
 		if not v:
@@ -168,6 +234,8 @@ def main():
 		if p is None:
 			continue
 		end = reset_time(v.get("resets_at"))
+		if cached and (end is None or end <= NOW):
+			continue
 		left = resets_in(end) if end is not None else None
 		sched = week_elapsed(end) if key == "seven_day" and end is not None else None
 		tail = c(90, f"↺{left}") if left else ""

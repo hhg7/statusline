@@ -20,9 +20,14 @@
 # generated timestamps all read one clock; before it, a reset 11.5h out could
 # round to 11h in one process and 12h in the next. statusline-test-pace.py then
 # checks the ration bar against hand-worked windows on fixed clocks of its own.
+#
+# STATUSLINE_CACHE is set empty, which turns the rate-limit cache off, so the
+# payloads here neither read nor overwrite the live one in ~/.cache.
+# statusline-test-cache.py then checks the cache in temporary directories.
 set -u
 cd "$(dirname "$0")" || exit 1
 export STATUSLINE_NOW=${STATUSLINE_NOW:-$(python3 -c 'import time; print(repr(time.time()))')}
+export STATUSLINE_CACHE=
 PY=./statusline.py
 C=${STATUSLINE_BIN:-./statusline}
 FUZZ=${1:-3000}
@@ -46,6 +51,7 @@ done < <(python3 statusline-test-cases.py)
 STATUSLINE_BIN=$C python3 statusline-test-fuzz.py "$FUZZ" || bad=$((bad + 1))
 STATUSLINE_BIN=$C python3 statusline-test-floats.py || bad=$((bad + 1))
 STATUSLINE_BIN=$C python3 statusline-test-pace.py || bad=$((bad + 1))
+STATUSLINE_BIN=$C python3 statusline-test-cache.py || bad=$((bad + 1))
 
 printf '%s: %d curated cases, %d mismatches (plus the %d-payload fuzz above)\n' "$C" "$tot" "$bad" "$FUZZ"
 [ "$bad" -eq 0 ]

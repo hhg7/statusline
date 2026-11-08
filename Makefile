@@ -18,7 +18,8 @@ ifeq ($(strip $(JSONC_LIBS)),)
 JSONC_LIBS := -ljson-c
 endif
 
-# -lm is for rint() and isnan() in bar() and pystr_double().
+# -lm is for rint(), trunc() and isnan() in bar(), human(), pyfloat() and
+# pystr_double().
 LIBM := -lm
 
 .PHONY: all nodeps test test-nodeps install install-nodeps uninstall clean

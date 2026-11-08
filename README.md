@@ -76,7 +76,7 @@ The bar and the percentages are green under 60%, yellow from 60%, red from 80%.
 
 `statusline.py` is the reference implementation: readable, and the thing the C
 is checked against. `statusline-test.sh` runs both over curated payloads,
-malformed input, every ISO-8601 form CPython 3.12 was observed to accept or
+malformed input, every ISO-8601 form CPython 3.14 was observed to accept or
 reject, and several thousand randomised payloads, and compares stdout byte for
 byte.
 

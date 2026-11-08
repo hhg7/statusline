@@ -3,7 +3,7 @@
 
 Covers every field the status line reads, the empty/zero/overflow edges of
 each, the rounding boundaries in bar()/human()/pct(), malformed and non-object
-documents, and the ISO-8601 forms CPython 3.12.3 was observed to accept or
+documents, and the ISO-8601 forms CPython 3.14.2 was observed to accept or
 reject. Timestamps are generated relative to now, so cases stay meaningful."""
 
 import json
@@ -57,12 +57,29 @@ cases = [
 	{"context_window": {"total_input_tokens": 15, "context_window_size": 100}},
 	{"context_window": {"total_input_tokens": 25, "context_window_size": 100}},
 	{"context_window": None},
+	# past the range of int and long long, where a C cast would be undefined
+	{"context_window": {"total_input_tokens": 3e10, "context_window_size": 1}},
+	{"context_window": {"total_input_tokens": -3e10, "context_window_size": 1}},
+	{"context_window": {"total_input_tokens": 1e20, "context_window_size": 1e30}},
+	{"context_window": {"total_input_tokens": 9223372036854775807, "context_window_size": 1e30}},
+	{"context_window": {"total_input_tokens": -0.5, "context_window_size": 100}},
+	{"model": {"display_name": "X"}, "effort": {"level": 9223372036854775807}},
+	{"model": {"display_name": "X"}, "effort": {"level": 9223372036854775808}},
+	{"model": {"display_name": "X"}, "effort": {"level": 18446744073709551615}},
+	{"model": {"display_name": "X"}, "effort": {"level": -9223372036854775808}},
 	# rate limits: fraction vs percentage, colour thresholds, reset formatting
 	rl(used_percentage=0.42, resets_at=iso(3.4)),
 	rl(used_percentage=42, resets_at=iso(0.7)),
+	# a fractional-second stamp, which the C keeps to the microsecond as datetime does
+	rl(used_percentage=42, resets_at=(now + timedelta(hours=11.5, microseconds=999)).isoformat()),
 	rl(used_percentage="61.5", resets_at=iso(-2)),
 	rl(used_percentage=True),
 	rl(used_percentage=None),
+	# float() of a string: underscores, inf/nan spellings, and what strtod() alone gets wrong
+	*[rl(used_percentage=v) for v in (
+		"4_5.0", "1e1_0", "1__0", "_1", "1_", "1_.5", "1._5", "1_e5", " 45 ", "\v45\f",
+		"\x1c45", "inf", "-Infinity", "+NaN", "-nan", "nan(1)", "infinit", "in_f", "0x10",
+		"0x1.8p3", ".5", "5.", ".", " ", "", "1e", "1e+", "1E-2", "45%")],
 	rl(used_percentage=59.4), rl(used_percentage=59.6),
 	rl(used_percentage=79.4), rl(used_percentage=79.6),
 	{"rate_limits": {"five_hour": {"used_percentage": 85},
@@ -92,7 +109,7 @@ cases = [
 	 "cost": {"total_cost_usd": 4.7}, "workspace": {"current_dir": "/home/con/.claude"}},
 ]
 
-# ISO-8601 acceptance, checked against CPython 3.12.3 rather than the grammar
+# ISO-8601 acceptance, checked against CPython 3.14.2 rather than the grammar
 stamps = [
 	"2026-13-99T99:99:99Z", "2026-02-30T00:00:00Z", "2026-02-29T00:00:00Z",
 	"2028-02-29T00:00:00Z", "2026-00-10T00:00:00Z", "2026-01-00T00:00:00Z",
@@ -106,7 +123,16 @@ stamps = [
 	"2027-01-01T05:30:15z", "2027-01-01T05:30:15+02:00", "2027-01-01T05:30:15-08:00",
 	"2027-01-01T05:30:15+0200", "2027-01-01T05:30:15+02", "2027-01-01T05:30:15+02:00:30",
 	"2027-01-01T05:30:15+24:00", "2027-01-01T05:30:15+23:59", "2027-01-01T05:30:15+02:60",
-	"2027-01-01T05:30:15+23:60", "2027-01-01T05:30:15Zjunk", "2027-01-01T0530:15",
+	"2027-01-01T05:30:15+23:60", "2027-01-01T05.5", "2027-01-01T05:30.5",
+	"2027-01-01T05:30:15+01:00:00.5", "2027-01-01T05:30:15+01:00:00,5", "2027-01-01T05:30:15+01.5",
+	"2027-01-01T05:30:15+01:00.5", "2027-01-01T05:30:15+0100.5", "2027-01-01T05:30:15+010000.5",
+	"2027-01-01T05:30:15+01:00:00.", "2027-01-01T05:30:15+01.", "2027-01-01T05:30:15+01.+",
+	"2027-01-01T05:30:15+01:00:00.5x", "2027-01-01T05:30:15+23:59:59.999999",
+	"2027-01-01T24:00:00Z", "2027-12-31T24:00", "2027-12-31T24", "2027-12-31T2400",
+	"2028-02-28T24:00:00.000000", "2027-01-01T24:00:00.0000001", "2027-01-01T24:00:00,5",
+	"2027-01-01T24:00:01", "2027-01-01T24:01", "2027-02-30T24:00", "2027-01-01T24:00:00+05:00",
+	"2027-01-01T25:00", "2027-01-01T05:30:15.+02:00", "2027-01-01T05:30:15+01:00:00.+",
+	"2027-01-01T05:30:15Zjunk", "2027-01-01T0530:15",
 	"2027-01-01T05:3015", "20270101T053015", "20270101T05:30:15", "20270101",
 	"20270101T0530", "2027-01-01T0530", "2027-0101", "202701-01", "2026-W01-1",
 	"", "bogus", "9999-12-31T23:59:59Z", "1970-01-01T00:00:00Z", None,

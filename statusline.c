@@ -23,7 +23,7 @@ reject the trailing garbage and leading zeros that Python's json module also
 rejects; the default mode accepts both. Parsed objects are never freed: the
 process reads one small payload, prints a line and exits.
 
-Four inputs render differently from the Python, all of them malformed and none
+These inputs render differently from the Python, all of them malformed and none
 of them emitted by the binary. statusline-test.sh leaves them out because it
 compares for equality; they were measured, not assumed:
 
@@ -35,7 +35,15 @@ compares for equality; they were measured, not assumed:
     Python builds the surrogate and then dies encoding it to stdout.
   single-quoted object keys ("{'cost':{...}}") -- json-c accepts them even
     under STRICT, where Python's json and statusline-nodeps.c both reject. This
-    one is a laxity the library brings in, not a choice.*/
+    one is a laxity the library brings in, not a choice.
+  an infinite or NaN context-window percentage or token count (1e400,
+    Infinity) -- Python's round() or int() raises; the C draws the segment.
+  an integer outside 64 bits anywhere in the document -- json-c fails the whole
+    parse and the line goes blank; Python carries on with the big int.
+  a "\u0000" in a string, or a NUL byte in the raw input -- json-c keeps the
+    NUL, but C strings end at it, so "Z\u0000junk" passes as a timestamp and
+    "{}\0garbage" parses, where Python rejects both.
+  a non-ASCII digit in a string used_percentage -- see pyfloat().*/
 
 #define _DEFAULT_SOURCE   /*for timegm(), which is not in C11*/
 
@@ -202,7 +210,12 @@ static char *pystr(struct json_object *o)
 {
 	switch (json_object_get_type(o)) {
 	case json_type_string:  return ssprintf("%s", json_object_get_string(o));
-	case json_type_int:     return ssprintf("%" PRId64, json_object_get_int64(o));
+	case json_type_int:
+		/*json-c holds 2^63..2^64-1 as a uint64, which get_int64() clamps to
+		INT64_MAX; Python's int has no ceiling, so read those back unsigned.*/
+		if (json_object_get_int64(o) == INT64_MAX)
+			return ssprintf("%" PRIu64, json_object_get_uint64(o));
+		return ssprintf("%" PRId64, json_object_get_int64(o));
 	case json_type_double:  return pystr_double(json_object_get_double(o));
 	case json_type_boolean: return json_object_get_boolean(o) ? ssprintf("True")
 	                                                          : ssprintf("False");
@@ -226,25 +239,80 @@ a displayed 100%, seen 2026-09-18 with the bar reading "5h 100%" while /usage
 reported 2%. A fraction-encoded 2% would have arrived as 0.02 and displayed
 correctly, so the fraction case does not occur -- the guess could only ever
 misfire, never help.*/
-static int pct(struct json_object *o, double *out)
+/*float(s) for a str, 1 on success.
+
+Matches CPython's float_from_string_inner() in Objects/floatobject.c and
+_Py_string_to_number_with_underscores() in Python/pystrtod.c, with each rule
+below checked against 3.12.3 and 3.14.2, which agree, rather than read off the
+source: surrounding whitespace is stripped (exactly C's isspace() set -- "\x1c"
+is not), then the rest must be a decimal literal or inf/infinity/nan in any case, each with an
+optional sign. An underscore is allowed only between two digits and is dropped
+before conversion, so "1e1_0" is 1e10 but "1_.5" and "1__0" fail.
+
+strtod() alone is wrong in both directions: it accepts hex floats ("0x10") and
+"nan(...)", and stops at an underscore. It keeps the sign of "-nan" too, which
+printf shows and Python's formatting does not, so a NaN is returned unsigned.
+
+Not handled: the non-ASCII digits that float() also takes ("١٢" is 12.0), which
+would need the string decoded from UTF-8 first.*/
+static int pyfloat(const char *s, double *out)
 {
-	double d;
-	if (!jnum(o, &d)) {
-		/*float("45") succeeds in Python, so a numeric string is accepted too.*/
-		const char *s = jstr(o);
-		if (!s)
+	while (isspace((unsigned char)*s))
+		s++;
+	size_t n = strlen(s);
+	while (n > 0 && isspace((unsigned char)s[n - 1]))
+		n--;
+
+	char *buf = xmalloc(n + 1);
+	size_t k = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (s[i] == '_') {
+			if (i == 0 || i + 1 == n || !isdigit((unsigned char)s[i - 1])
+			    || !isdigit((unsigned char)s[i + 1]))
+				return 0;
+			continue;
+		}
+		buf[k++] = s[i];
+	}
+	buf[k] = '\0';
+
+	const char *p = buf;
+	if (*p == '+' || *p == '-')
+		p++;
+	if (strcasecmp(p, "inf") && strcasecmp(p, "infinity") && strcasecmp(p, "nan")) {
+		int digits = 0;
+		for (; isdigit((unsigned char)*p); p++)
+			digits++;
+		if (*p == '.')
+			for (p++; isdigit((unsigned char)*p); p++)
+				digits++;
+		if (!digits)
 			return 0;
-		char *end;
-		d = strtod(s, &end);
-		if (end == s)
-			return 0;
-		while (isspace((unsigned char)*end))
-			end++;
-		if (*end != '\0')
+		if (*p == 'e' || *p == 'E') {
+			p++;
+			if (*p == '+' || *p == '-')
+				p++;
+			if (!isdigit((unsigned char)*p))
+				return 0;
+			while (isdigit((unsigned char)*p))
+				p++;
+		}
+		if (*p != '\0')
 			return 0;
 	}
-	*out = d;
+
+	double d = strtod(buf, NULL);
+	*out = isnan(d) ? NAN : d;
 	return 1;
+}
+
+static int pct(struct json_object *o, double *out)
+{
+	if (jnum(o, out))
+		return 1;
+	/*float("45") succeeds in Python, so a numeric string is accepted too.*/
+	const char *s = jstr(o);
+	return s && pyfloat(s, out);
 }
 
 //Green under 60%, yellow from 60%, red from 80%
@@ -260,12 +328,12 @@ static char *bar(double p)
 {
 	const int width = 10;
 	/*rint() rounds half to even under the default mode, as Python's round() does.
-	A NaN percentage casts to an unspecified int, so it is pinned to empty here.*/
-	int filled = isnan(p) ? 0 : (int)rint(p / 100 * width);
-	if (filled < 0)
-		filled = 0;
-	if (filled > width)
-		filled = width;
+	The clamp happens on the double, before the cast: converting a value outside
+	int's range is undefined, and on x86-64 gives INT_MIN, which drew a 3e12%
+	context window as an empty bar where Python's unbounded round() fills it. A
+	NaN fails both comparisons and is pinned to empty.*/
+	double r = rint(p / 100 * width);
+	int filled = r >= width ? width : (r > 0 ? (int)r : 0);
 
 	sbuf f = { NULL, 0, 0 }, e = { NULL, 0, 0 };
 	sput(&f, "", 0);
@@ -278,13 +346,25 @@ static char *bar(double p)
 	return ssprintf("%s%s", col(colour_for(p), f.p), col(90, e.p));
 }
 
-static char *human(long long n)
+/*human(int(d)).
+
+Kept in double because Python's int() is unbounded: a cast to long long is
+undefined past 2^63, and printed 1e20 tokens as -9223372036854775808 where the
+Python gives "100000000000000.0M". trunc() is int()'s rounding toward zero, and
+adding 0.0 turns the -0.0 it leaves for (-1, 0) into the "0" that str(int)
+prints. The quotients match Python's correctly rounded int/int division, since
+an integral double divided by an exact power of ten is rounded once. The one
+gap is an integer token count past 2^53, which json-c has already rounded to a
+double before it gets here. Infinity and NaN reach this only on payloads where
+Python's int() raises.*/
+static char *human(double d)
 {
+	double n = trunc(d) + 0.0;
 	if (n >= 1000000)
-		return ssprintf("%.1fM", (double)n / 1000000.0);
+		return ssprintf("%.1fM", n / 1000000.0);
 	if (n >= 1000)
-		return ssprintf("%.0fk", (double)n / 1000.0);
-	return ssprintf("%lld", n);
+		return ssprintf("%.0fk", n / 1000.0);
+	return ssprintf("%.0f", n);
 }
 
 /*Read exactly `width` ASCII digits, advancing the cursor; 0 if they are not there.
@@ -305,23 +385,52 @@ static int read_digits(const char **p, int width, int *out)
 	return 1;
 }
 
-/*Parse an ISO-8601 timestamp to a Unix time, 1 on success.
+/*Read an optional [.,]digits fraction as microseconds, 0 if it is malformed.
 
-Accepts what datetime.fromisoformat() does on CPython 3.12, since the Python
+As parse_hh_mm_ss_ff() in CPython 3.14.2 Modules/_datetimemodule.c does it: the
+first six digits are kept, a shorter run is scaled up (".5" is 500000), and any
+further digits are skipped, not rounded. The digits may be absent only when
+something follows, which is the quirk described under "fraction" below.*/
+static int read_fraction(const char **p, int *us)
+{
+	*us = 0;
+	if (**p != '.' && **p != ',')
+		return 1;
+	(*p)++;
+	int digits = 0;
+	for (; isdigit((unsigned char)**p); (*p)++)
+		if (digits++ < 6)
+			*us = *us * 10 + (**p - '0');
+	for (int i = digits; i < 6; i++)
+		*us *= 10;
+	return digits || **p != '\0';
+}
+
+/*Parse an ISO-8601 timestamp to microseconds since 1970 UTC, 1 on success.
+
+Accepts what datetime.fromisoformat() does on CPython 3.14, since the Python
 this replaces hands it whatever the payload carries and shows nothing when it
-raises. Each rule below was checked against 3.12.3 rather than read off the
-grammar, because several are quirks rather than ISO:
+raises; 3.14 is what `python3` runs statusline.py under on this machine. Each
+rule below was checked against 3.14.2 rather than read off the grammar, because
+several are quirks rather than ISO. Where 3.12.3 differs, that is noted:
 
   date      YYYY-MM-DD or YYYYMMDD, never half-separated ("2027-0101" raises)
   time      HH, HH:MM, HH:MM:SS, HHMM, HHMMSS -- colons all-or-nothing within
             the time, but independent of the date's dashes ("20270101T05:30:15"
-            parses)
-  fraction  [.,] then digits; dropped here, as the output is whole minutes. A
-            bare "." at end of string raises, yet "15.+02:00" parses, so the
-            digits are only required when nothing follows
-  offset    +/-HH[:MM[:SS]], basic or extended, and rejected when the total
-            reaches 24h -- the fields themselves are unchecked, so "+02:60"
-            parses as +03:00
+            parses). Hour 24 is midnight of the next day, allowed only with
+            minutes, seconds and fraction all zero ("T24", "T24:00:00.0");
+            3.12 rejects every hour 24
+  fraction  [.,] then digits, only straight after the seconds, kept to the
+            microsecond as datetime keeps it. A bare "." at end of string raises,
+            yet "15.+02:00" parses, so the digits are only required when
+            nothing follows. 3.12 also takes a fraction after the hour or
+            minute ("T05.5", "T05:30.5")
+  offset    +/-HH[:MM[:SS]], basic or extended, then a fraction under the same
+            rules ("+01:00:00.5" parses, "+01.5" does not in 3.14 but does in
+            3.12), and rejected when the total reaches 24h -- the fields
+            themselves are unchecked, so "+02:60" parses as +03:00. CPython
+            reads the offset with the same routine as the time, which is where
+            all of this comes from
   naive     read as UTC, matching the tz-less branch in the Python
 
 "Z" is not handled here: the caller's str.replace("Z", "+00:00") runs first, as
@@ -329,10 +438,10 @@ in the Python, which is also why a lowercase "z" is rejected.
 
 Not accepted, and not emitted by the status-line payload: ordinal and week
 dates (2026-W01-1).*/
-static int parse_iso8601(const char *s, time_t *out)
+static int parse_iso8601(const char *s, int64_t *out)
 {
 	const char *p = s;
-	int y, mo, d, h = 0, mi = 0, se = 0;
+	int y, mo, d, h = 0, mi = 0, se = 0, us = 0;
 
 	/*Date. The dashes are all-or-nothing.*/
 	if (!read_digits(&p, 4, &y))
@@ -347,12 +456,13 @@ static int parse_iso8601(const char *s, time_t *out)
 	if (!read_digits(&p, 2, &d))
 		return 0;
 
-	long off = 0;
+	int64_t off = 0;   // UTC offset in microseconds
 	if (*p == 'T' || *p == 't' || *p == ' ') {
 		p++;
 		if (!read_digits(&p, 2, &h))
 			return 0;
 		int colon = (*p == ':');
+		int secs = 0;   // 1 = a seconds field was read, so a fraction may follow
 		if (colon)
 			p++;
 		if (isdigit((unsigned char)*p)) {
@@ -363,25 +473,21 @@ static int parse_iso8601(const char *s, time_t *out)
 					p++;
 					if (!read_digits(&p, 2, &se))
 						return 0;
+					secs = 1;
 				}
 			} else if (isdigit((unsigned char)*p)) {
 				if (!read_digits(&p, 2, &se))
 					return 0;
+				secs = 1;
 			}
 		} else if (colon) {
 			return 0;   /*"05:" with no minutes*/
 		}
 
-		if (*p == '.' || *p == ',') {
-			p++;
-			int digits = 0;
-			while (isdigit((unsigned char)*p)) {
-				p++;
-				digits++;
-			}
-			if (!digits && *p == '\0')
-				return 0;
-		}
+		/*A fraction anywhere else is left unread, and the final check on *p
+		rejects it.*/
+		if (secs && !read_fraction(&p, &us))
+			return 0;
 
 		if (*p == '+' || *p == '-') {
 			int sign = (*p == '-') ? -1 : 1;
@@ -390,6 +496,7 @@ static int parse_iso8601(const char *s, time_t *out)
 			if (!read_digits(&p, 2, &oh))
 				return 0;
 			int ocolon = (*p == ':');
+			int osecs = 0;   // 1 = the offset has a seconds field
 			if (ocolon)
 				p++;
 			if (isdigit((unsigned char)*p)) {
@@ -400,22 +507,32 @@ static int parse_iso8601(const char *s, time_t *out)
 						p++;
 						if (!read_digits(&p, 2, &os))
 							return 0;
+						osecs = 1;
 					}
 				} else if (isdigit((unsigned char)*p)) {
 					if (!read_digits(&p, 2, &os))
 						return 0;
+					osecs = 1;
 				}
 			} else if (ocolon) {
 				return 0;
 			}
-			long total = oh * 3600L + om * 60L + os;
-			if (total >= 24 * 3600L)
+			int ous = 0;
+			if (osecs && !read_fraction(&p, &ous))
+				return 0;
+			int64_t total = (oh * 3600LL + om * 60LL + os) * 1000000 + ous;
+			if (total >= 24 * 3600LL * 1000000)
 				return 0;
 			off = sign * total;
 		}
 	}
 	if (*p != '\0')
 		return 0;
+	/*Hour 24 is checked as hour 0 of the same date and moved on a day at the
+	end, so the date itself is still validated.*/
+	int next_day = (h == 24 && mi == 0 && se == 0 && us == 0);
+	if (next_day)
+		h = 0;
 	if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 59)
 		return 0;
 
@@ -441,7 +558,7 @@ static int parse_iso8601(const char *s, time_t *out)
 	    || back.tm_hour != h || back.tm_min != mi || back.tm_sec != se)
 		return 0;
 
-	*out = t - off;
+	*out = ((int64_t)t + (next_day ? 24 * 3600 : 0)) * 1000000 + us - off;
 	return 1;
 }
 
@@ -463,10 +580,24 @@ static char *resets_in(struct json_object *o)
 			sput(&z, q, 1);
 	}
 
-	time_t t;
+	int64_t t;
 	if (!parse_iso8601(z.p, &t))
 		return NULL;
-	double hours = difftime(t, time(NULL)) / 3600.0;
+
+	/*(t - datetime.now(timezone.utc)).total_seconds() / 3600, step for step.
+	now() is the system clock rounded down to the microsecond
+	(datetime_best_possible(), _PyTime_ROUND_FLOOR, in CPython 3.14.2), the
+	difference is exact in whole microseconds, and total_seconds() divides that
+	integer by 10**6 with one rounding. time(NULL) was too coarse: it is up to a
+	second behind Python's clock, which turned a reset exactly 11.5h out into
+	"12h" (11.5 rounded half to even) where the Python, a few microseconds past
+	it, printed "11h". The (double) conversion is exact below 2^53 microseconds,
+	about 285 years, so only a reset centuries away can round twice.*/
+	struct timespec ts_now;
+	if (clock_gettime(CLOCK_REALTIME, &ts_now) != 0)
+		return NULL;
+	int64_t now = (int64_t)ts_now.tv_sec * 1000000 + ts_now.tv_nsec / 1000;
+	double hours = (double)(t - now) / 1000000.0 / 3600.0;
 	if (hours <= 0)
 		return NULL;
 	return hours >= 1 ? ssprintf("%.0fh", hours) : ssprintf("%.0fm", hours * 60);
@@ -526,8 +657,7 @@ int main(void)
 	    && jnum(jget(cw, "context_window_size"), &size) && size != 0) {
 		double p = used / size * 100;
 		char *ppct = col(colour_for(p), ssprintf("%.0f%%", p));
-		char *counts = col(90, ssprintf("%s/%s", human((long long)used),
-		                                         human((long long)size)));
+		char *counts = col(90, ssprintf("%s/%s", human(used), human(size)));
 		parts[np++] = ssprintf("%s %s %s", bar(p), ppct, counts);
 	}
 

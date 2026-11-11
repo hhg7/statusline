@@ -4,12 +4,17 @@
 Covers every field the status line reads, the empty/zero/overflow edges of
 each, the rounding boundaries in bar()/human()/pct(), malformed and non-object
 documents, and the ISO-8601 forms CPython 3.14.2 was observed to accept or
-reject. Timestamps are generated relative to now, so cases stay meaningful."""
+reject. Timestamps are generated relative to now -- STATUSLINE_NOW when
+statusline-test.sh sets it, which is also the clock both builds then read -- so
+cases stay meaningful."""
 
 import json
+import os
+import time
 from datetime import datetime, timezone, timedelta
 
-now = datetime.now(timezone.utc)
+NOW = float(os.environ.get("STATUSLINE_NOW", time.time()))
+now = datetime.fromtimestamp(NOW, timezone.utc)
 
 
 def iso(h):
@@ -18,6 +23,11 @@ def iso(h):
 
 def rl(**kw):
 	return {"rate_limits": {"five_hour": kw}}
+
+
+def wk(used, h):
+	"""A seven_day window resetting h hours from now, as a Unix time."""
+	return {"rate_limits": {"seven_day": {"used_percentage": used, "resets_at": NOW + h * 3600}}}
 
 
 cases = [
@@ -70,8 +80,6 @@ cases = [
 	# rate limits: fraction vs percentage, colour thresholds, reset formatting
 	rl(used_percentage=0.42, resets_at=iso(3.4)),
 	rl(used_percentage=42, resets_at=iso(0.7)),
-	# a fractional-second stamp, which the C keeps to the microsecond as datetime does
-	rl(used_percentage=42, resets_at=(now + timedelta(hours=11.5, microseconds=999)).isoformat()),
 	rl(used_percentage="61.5", resets_at=iso(-2)),
 	rl(used_percentage=True),
 	rl(used_percentage=None),
@@ -80,6 +88,7 @@ cases = [
 		"4_5.0", "1e1_0", "1__0", "_1", "1_", "1_.5", "1._5", "1_e5", " 45 ", "\v45\f",
 		"\x1c45", "inf", "-Infinity", "+NaN", "-nan", "nan(1)", "infinit", "in_f", "0x10",
 		"0x1.8p3", ".5", "5.", ".", " ", "", "1e", "1e+", "1E-2", "45%")],
+	*[wk(v, 60) for v in ("4_5.0", "-nan", "0x10")],
 	rl(used_percentage=59.4), rl(used_percentage=59.6),
 	rl(used_percentage=79.4), rl(used_percentage=79.6),
 	{"rate_limits": {"five_hour": {"used_percentage": 85},
@@ -87,6 +96,28 @@ cases = [
 	                 "spend_limit": {"used_percentage": 1.0}}},
 	{"rate_limits": {"five_hour": {}, "seven_day": None,
 	                 "spend_limit": {"used_percentage": None}}},
+	# resets_at as the binary sends it, a Unix time in seconds
+	rl(used_percentage=42, resets_at=int(NOW) + 7200),
+	rl(used_percentage=42, resets_at=NOW + 1800.5),
+	rl(used_percentage=42, resets_at=int(NOW) - 60),
+	rl(used_percentage=42, resets_at=0),
+	rl(used_percentage=42, resets_at=True),
+	rl(used_percentage=42, resets_at=1e300),
+	rl(used_percentage=42, resets_at=[1]),
+	# the 7d on-pace budget: under, on and over pace, early and late in the week
+	wk(0, 167.9), wk(0, 84), wk(0, 0.1), wk(50, 84), wk(49, 84), wk(51, 84),
+	wk(5, 150), wk(30, 150), wk(90, 150), wk(5, 50), wk(30, 50), wk(90, 50),
+	wk(100, 1), wk(120, 1), wk(-5, 100), wk(35.7, 100), wk(45.9, 100),
+	wk("61.5", 60), wk("nan", 60), wk("inf", 60), wk(True, 60), wk(1e300, 60),
+	# a reset more than a week out, so the window has not opened yet
+	wk(10, 200), wk(10, 10000),
+	# past the year 9999, where Python's datetime gives up
+	{"rate_limits": {"seven_day": {"used_percentage": 10, "resets_at": 253402300800}}},
+	{"rate_limits": {"seven_day": {"used_percentage": 10, "resets_at": 253402300799}}},
+	{"rate_limits": {"seven_day": {"used_percentage": 10, "resets_at": 1e12}}},
+	{"rate_limits": {"seven_day": {"used_percentage": 10, "resets_at": iso(70)}}},
+	{"rate_limits": {"seven_day": {"used_percentage": 10, "resets_at": iso(-1)}}},
+	{"rate_limits": {"seven_day": {"used_percentage": 10}}},
 	# cost and cwd
 	{"cost": {"total_cost_usd": 0}},
 	{"cost": {"total_cost_usd": 12.3456}},
@@ -107,6 +138,11 @@ cases = [
 	                 "seven_day": {"used_percentage": 0.08, "resets_at": iso(96)},
 	                 "spend_limit": {"used_percentage": 0.955, "resets_at": iso(400)}},
 	 "cost": {"total_cost_usd": 4.7}, "workspace": {"current_dir": "/home/con/.claude"}},
+	{"model": {"display_name": "Opus 5.5"}, "effort": {"level": "high"},
+	 "context_window": {"total_input_tokens": 62000, "context_window_size": 220000},
+	 "rate_limits": {"five_hour": {"used_percentage": 41.0, "resets_at": int(NOW) + 10800},
+	                 "seven_day": {"used_percentage": 38.2, "resets_at": int(NOW) + 200000}},
+	 "cost": {"total_cost_usd": 1.84}, "workspace": {"current_dir": "/home/con/Scripts/C/statusline"}},
 ]
 
 # ISO-8601 acceptance, checked against CPython 3.14.2 rather than the grammar
@@ -138,7 +174,9 @@ stamps = [
 	"", "bogus", "9999-12-31T23:59:59Z", "1970-01-01T00:00:00Z", None,
 ] + [(now + timedelta(hours=x)).strftime("%Y-%m-%dT%H:%M:%SZ")
      for x in (0.4, 0.9, 1.0, 1.5, 2.5, 23.5, 168, 999)] \
-  + [(now + timedelta(hours=x)).isoformat() for x in (0.51, 5, 100)]
+  + [(now + timedelta(hours=x)).isoformat() for x in (0.51, 5, 100)] \
+  + [(now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S") + f for f in
+     (".1234567", ".9999999", ",25", ".000001", ".5+01:00")]
 
 for s in stamps:
 	cases.append(rl(used_percentage=50, resets_at=s))
@@ -149,7 +187,11 @@ for x in cases:
 # Malformed and non-object documents, emitted raw rather than via json.dumps
 for raw in ['   ', '{"model":{"display_name":"X"}', 'not json at all', '[]', '[1,2,3]',
             '"a string"', 'null', '42', '{"model":"notadict"}', '{"a":1,"a":2}',
-            '{"a":01}', '{} trailing', '{}{}', '{"a":1e400}', '{"a":NaN}',
+            '{"a":01}', '{} trailing',
+            # number literals as effort.level, where a loose parser shows them
+            *['{"model":{"display_name":"X"},"effort":{"level":%s}}' % v for v in (
+                "Infinity", "-Infinity", "NaN", "0x10", "01", "+5", ".5", "-", "1E2", "-0",
+                "18446744073709551615")], '{}{}', '{"a":1e400}', '{"a":NaN}',
             '{"workspace":{"current_dir":"/a/b\\u00e9/c\\ud83d\\ude00d"}}',
             '{"model":{"display_name":"A\\"B\\\\C\\tD"}}', '{"model":{"display_name":5}}']:
 	print(raw)

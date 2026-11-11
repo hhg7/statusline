@@ -18,8 +18,13 @@ if not os.path.isabs(C):
 	C = os.path.join(HERE, C) if os.sep in C else C
 
 random.seed(7)
+import time
 from datetime import datetime, timezone, timedelta
-now = datetime.now(timezone.utc)
+# The clock both builds read; statusline-test.sh exports it. Standalone, pin it
+# here so the two children cannot straddle a rounding boundary between them.
+os.environ.setdefault("STATUSLINE_NOW", repr(time.time()))
+NOW = float(os.environ["STATUSLINE_NOW"])
+now = datetime.fromtimestamp(NOW, timezone.utc)
 
 
 def rnum():
@@ -37,6 +42,8 @@ def rts():
 	return random.choice([
 		(now + timedelta(minutes=random.randint(-100, 10000))).strftime("%Y-%m-%dT%H:%M:%SZ"),
 		(now + timedelta(seconds=random.randint(0, 400000))).isoformat(),
+		int(NOW) + random.randint(-3600, 700000),
+		NOW + random.uniform(-3600, 700000),
 		None, "", "bogus", "2026-13-99T99:99:99Z", "2026-02-30T12:00:00Z",
 	])
 

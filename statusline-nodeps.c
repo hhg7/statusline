@@ -4,56 +4,131 @@ Reads the status-line JSON payload on stdin and prints one ANSI-coloured line.
 Payload shape taken from the 2.1.276 binary (function q$o/xnt): keys used here
 are model.display_name, workspace.current_dir, context_window.{total_input_tokens,
 context_window_size}, cost.total_cost_usd, and rate_limits.{five_hour,seven_day,
-spend_limit}.{used_percentage,resets_at}.
+spend_limit}.{used_percentage,resets_at}. In 2.1.281 (function jjn) resets_at is
+the rate-limit window's own resets_at, a Unix time in seconds; an ISO-8601
+string is still accepted.
+
+The 7d segment carries the on-pace budget after its own percentage, as
+"7d 35%/67.2%", after ~/Scripts/C/token.rationing.c: the weekly quota resets
+Saturday 07:00 America/Chicago, per the account's stated weekly-limit reset, and
+an even burn would by now have spent the fraction of the window already elapsed.
+Using less than the second number leaves ration to spare; using more turns
+the segment red, whatever its own percentage.
 
 A translation of statusline.py with no dependency beyond libc, kept as the
 fallback for a machine without json-c; statusline.c is the maintained version
-and links against json-c instead. Build and install with:
+and links against json-c instead. STATUSLINE_NOW, a Unix time, stands in for
+the clock, so that the test compares this and the Python at the same instant.
+Build and install with:
 	make nodeps && make install-nodeps
 Re-check after a Claude Code upgrade with:
 	make test-nodeps
 and with `echo '{}' | ~/.claude/statusline` against /context and /usage
-in-session.
+in-session. `make valgrind-nodeps` checks that every allocation is freed.
 
 There is no JSON parser in the C library and none installed here, so one is
-hand-rolled below -- it also keeps the binary free of shared-library deps. The
-parser allocates and never frees: the process reads one small payload, prints a
-line and exits, so the arena is the process itself.*/
+hand-rolled below -- it also keeps the binary free of shared-library deps.
 
-#define _DEFAULT_SOURCE   /*for timegm(), which is not in C11*/
+These inputs render differently from the Python, all of them malformed and none
+of them emitted by the binary; statusline-test.sh leaves them out because it
+compares for equality:
+
+  non-string display_name, and any non-object document ("[]", "42") -- the
+    Python raises and prints a traceback; this prints a blank segment.
+  an infinite or NaN context-window percentage or token count (1e400,
+    Infinity) -- Python's round() or int() raises; this draws the segment.
+  a "\u0000" in a string, or a NUL byte in the raw input -- C strings end at
+    it, so "Z\u0000junk" passes as a timestamp and "{}\0garbage" parses,
+    where Python rejects both.
+  a non-ASCII digit in a string used_percentage -- see pyfloat().*/
+
+#define _DEFAULT_SOURCE   /*for timegm() and tm_gmtoff, which are not in C11*/
 
 #include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /*strcasecmp(), POSIX rather than C11*/
 #include <time.h>
 
 #define RESET "\033[0m"
 
-static void *xmalloc(size_t n)
+/*The weekly reset is Chicago wall-clock, so a window across a DST change is 167
+or 169 hours rather than 168; token.rationing.c has the measurements.*/
+#define RESET_TZ "America/Chicago"
+#define WEEK     (7 * 86400.0)
+
+/*10000-01-01T00:00:00Z. Python's datetime stops at year 9999, so the reference
+cannot place a reset past this and neither does the C.*/
+#define YEAR_10000 253402300800.0
+
+static void *xrealloc(void *p, size_t n)
 {
-	void *p = malloc(n);
-	if (!p)
+	void *q = realloc(p, n);
+	if (!q)
 		exit(1);   /*nothing printed: the status line simply goes blank*/
-	return p;
+	return q;
 }
 
-/*printf into a freshly allocated string.*/
-static char *ssprintf(const char *fmt, ...)
+/*Growable string: the stdin slurp, and the output line as it is built.
+
+Every piece of the line is appended to one buffer rather than returned as a
+string of its own, so there is exactly one allocation to free at the end.*/
+typedef struct {
+	char *p;
+	size_t len, cap;
+} sbuf;
+
+/*Room for n more bytes and the NUL.*/
+static void sreserve(sbuf *b, size_t n)
 {
-	va_list ap, ap2;
+	if (b->len + n + 1 > b->cap) {
+		size_t cap = b->cap ? b->cap : 64;
+		while (b->len + n + 1 > cap)
+			cap *= 2;
+		b->p = xrealloc(b->p, cap);
+		b->cap = cap;
+	}
+}
+
+static void sput(sbuf *b, const char *s, size_t n)
+{
+	sreserve(b, n);
+	memcpy(b->p + b->len, s, n);
+	b->len += n;
+	b->p[b->len] = '\0';
+}
+
+static void sputs(sbuf *b, const char *s)
+{
+	sput(b, s, strlen(s));
+}
+
+/*printf onto the end of b. No argument may point into b itself: the buffer can
+move when it grows.*/
+static void sappf(sbuf *b, const char *fmt, ...)
+{
+	va_list ap;
 	va_start(ap, fmt);
-	va_copy(ap2, ap);
 	int n = vsnprintf(NULL, 0, fmt, ap);
 	va_end(ap);
 	if (n < 0)
 		exit(1);
-	char *s = xmalloc((size_t)n + 1);
-	vsnprintf(s, (size_t)n + 1, fmt, ap2);
-	va_end(ap2);
-	return s;
+	sreserve(b, (size_t)n);
+	va_start(ap, fmt);
+	vsnprintf(b->p + b->len, (size_t)n + 1, fmt, ap);
+	va_end(ap);
+	b->len += (size_t)n;
+}
+
+static void sfree(sbuf *b)
+{
+	free(b->p);
+	b->p = NULL;
+	b->len = b->cap = 0;
 }
 
 /*JSON value tree*/
@@ -72,45 +147,40 @@ struct jval {
 	jtype type;
 	double num;      // JNUM
 	int truth;       // JBOOL
-	char *str;       // JSTR, decoded and NUL-terminated
+	char *str;       // JSTR, decoded and NUL-terminated; JNUM, the literal as written
 	char **keys;     // JOBJ
 	jval **items;    // JARR and JOBJ
 	size_t n;
 	size_t cap;      // allocated slots in keys/items; see jpush()
-	int is_int;      // JNUM: the literal had no '.', 'e' or 'E', so Python made an int
+	int is_int;      // JNUM: the literal had no fraction or exponent, so Python made an int
 };
 
 static jval jnull = { JNULL, 0, 0, NULL, NULL, NULL, 0, 0, 0 };
 
 static jval *jnew(jtype t)
 {
-	jval *v = xmalloc(sizeof *v);
+	jval *v = xrealloc(NULL, sizeof *v);
 	memset(v, 0, sizeof *v);
 	v->type = t;
 	return v;
 }
 
-/*Growable string, used for decoded JSON strings.*/
-typedef struct {
-	char *p;
-	size_t len, cap;
-} sbuf;
-
-static void sput(sbuf *b, const char *s, size_t n)
+/*Free a tree and everything it owns. The shared jnull is static, so it is
+skipped, and anything jparse() or jget() returns can be passed. Recursion is
+bounded by MAX_DEPTH, as the parse that built the tree was.*/
+static void jfree(jval *v)
 {
-	if (b->len + n + 1 > b->cap) {
-		size_t cap = b->cap ? b->cap : 32;
-		while (b->len + n + 1 > cap)
-			cap *= 2;
-		char *q = xmalloc(cap);
-		if (b->p)
-			memcpy(q, b->p, b->len);
-		b->p = q;
-		b->cap = cap;
+	if (!v || v == &jnull)
+		return;
+	for (size_t i = 0; i < v->n; i++) {
+		if (v->keys)
+			free(v->keys[i]);
+		jfree(v->items[i]);
 	}
-	memcpy(b->p + b->len, s, n);
-	b->len += n;
-	b->p[b->len] = '\0';
+	free(v->keys);
+	free(v->items);
+	free(v->str);
+	free(v);
 }
 
 static void sputc(sbuf *b, char ch)
@@ -158,6 +228,8 @@ typedef struct {
 	int depth;  // containers currently open
 } jparser;
 
+/*Returns a value the caller owns, even when it clears js->ok: a container is
+then handed back half-built, or the static jnull, and either goes to jfree().*/
 static jval *jparse_value(jparser *js);
 
 static void jskip_ws(jparser *js)
@@ -244,7 +316,8 @@ static char *jparse_string(jparser *js)
 	}
 }
 
-/*Append one member, doubling the capacity when it runs out.
+/*Append one member, doubling the capacity when it runs out. v takes ownership
+of key and item.
 
 Growing by one and copying each time is quadratic, which a 200k-key document
 turns into a hang rather than a parse -- measured at over 20s before this, well
@@ -253,16 +326,9 @@ static void jpush(jval *v, char *key, jval *item)
 {
 	if (v->n == v->cap) {
 		size_t cap = v->cap ? v->cap * 2 : 8;
-		jval **items = xmalloc(cap * sizeof *items);
-		if (v->items)
-			memcpy(items, v->items, v->n * sizeof *items);
-		v->items = items;
-		if (v->type == JOBJ) {
-			char **keys = xmalloc(cap * sizeof *keys);
-			if (v->keys)
-				memcpy(keys, v->keys, v->n * sizeof *keys);
-			v->keys = keys;
-		}
+		v->items = xrealloc(v->items, cap * sizeof *v->items);
+		if (v->type == JOBJ)
+			v->keys = xrealloc(v->keys, cap * sizeof *v->keys);
 		v->cap = cap;
 	}
 	v->items[v->n] = item;
@@ -304,14 +370,18 @@ static jval *jparse_value(jparser *js)
 			}
 			char *key = jparse_string(js);
 			jskip_ws(js);
-			if (*js->p != ':') {
+			if (!js->ok || *js->p != ':') {
 				js->ok = 0;
+				free(key);
 				return v;
 			}
 			js->p++;
 			jval *item = jparse_value(js);
-			if (!js->ok)
+			if (!js->ok) {
+				free(key);
+				jfree(item);
 				return v;
+			}
 			jpush(v, key, item);
 			jskip_ws(js);
 			if (*js->p == ',') {
@@ -338,8 +408,10 @@ static jval *jparse_value(jparser *js)
 		}
 		for (;;) {
 			jval *item = jparse_value(js);
-			if (!js->ok)
+			if (!js->ok) {
+				jfree(item);
 				return v;
+			}
 			jpush(v, NULL, item);
 			jskip_ws(js);
 			if (*js->p == ',') {
@@ -379,21 +451,57 @@ static jval *jparse_value(jparser *js)
 		break;
 	}
 	{
-		char *end;
-		double d = strtod(js->p, &end);
-		if (end != js->p) {
-			/*Python's json builds an int from a token with no fraction and no
-			exponent and a float otherwise, and str() shows the difference:
-			str(3) is "3" where str(3.0) is "3.0". The distinction is only
-			recoverable from the literal, since both land in this double.*/
-			int is_int = 1;
-			for (const char *q = js->p; q < end; q++)
-				if (*q == '.' || *q == 'e' || *q == 'E')
-					is_int = 0;
-			js->p = end;
+		/*A number, by the JSON grammar -- -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+		-- plus the NaN, Infinity and -Infinity that Python's json also takes.
+		strtod() alone was far looser: it read "0x10", "01" and "+5", all of
+		which make Python's json.load() raise.*/
+		const char *q = js->p;
+		int is_int = 1;
+		if (strncmp(q, "NaN", 3) == 0)
+			q += 3, is_int = 0;
+		else if (strncmp(q, "Infinity", 8) == 0)
+			q += 8, is_int = 0;
+		else if (strncmp(q, "-Infinity", 9) == 0)
+			q += 9, is_int = 0;
+		else {
+			if (*q == '-')
+				q++;
+			if (*q == '0')
+				q++;
+			else if (*q >= '1' && *q <= '9')
+				while (isdigit((unsigned char)*q))
+					q++;
+			else
+				q = js->p;   // no digits: not a number
+			if (q != js->p && *q == '.') {
+				is_int = 0;
+				if (!isdigit((unsigned char)*++q))
+					q = js->p;
+				while (isdigit((unsigned char)*q))
+					q++;
+			}
+			if (q != js->p && (*q == 'e' || *q == 'E')) {
+				is_int = 0;
+				q++;
+				if (*q == '+' || *q == '-')
+					q++;
+				if (!isdigit((unsigned char)*q))
+					q = js->p;
+				while (isdigit((unsigned char)*q))
+					q++;
+			}
+		}
+		if (q != js->p) {
 			jval *v = jnew(JNUM);
-			v->num = d;
+			size_t n = (size_t)(q - js->p);
+			v->str = xrealloc(NULL, n + 1);
+			memcpy(v->str, js->p, n);
+			v->str[n] = '\0';
+			/*strtod() takes "NaN" and "Infinity" in any case, so the validated
+			token converts as written.*/
+			v->num = strtod(v->str, NULL);
 			v->is_int = is_int;
+			js->p = q;
 			return v;
 		}
 	}
@@ -401,14 +509,17 @@ static jval *jparse_value(jparser *js)
 	return &jnull;
 }
 
-/*json.load(): a whole document, or JNULL if it does not parse.*/
+/*json.load(): a whole document, or JNULL if it does not parse. The caller
+owns the result and releases it with jfree().*/
 static jval *jparse(const char *text)
 {
 	jparser js = { text, 1, 0 };
 	jval *v = jparse_value(&js);
 	jskip_ws(&js);
-	if (!js.ok || *js.p != '\0')
+	if (!js.ok || *js.p != '\0') {
+		jfree(v);
 		return &jnull;
+	}
 	return v;
 }
 
@@ -458,14 +569,18 @@ static const char *jstr(const jval *v)
 	return v->type == JSTR ? v->str : NULL;
 }
 
-/*str(float), matching CPython: shortest form that round-trips, and a trailing
-".0" on anything integral, so 3.0 prints as "3.0" rather than "3".*/
-static char *pystr_double(double d)
+/*Append str(float), matching CPython: shortest form that round-trips, and a
+trailing ".0" on anything integral, so 3.0 prints as "3.0" rather than "3".*/
+static void sput_pyfloat(sbuf *b, double d)
 {
-	if (isnan(d))
-		return ssprintf("nan");
-	if (isinf(d))
-		return ssprintf(d < 0 ? "-inf" : "inf");
+	if (isnan(d)) {
+		sputs(b, "nan");
+		return;
+	}
+	if (isinf(d)) {
+		sputs(b, d < 0 ? "-inf" : "inf");
+		return;
+	}
 
 	/*Fewest significant digits that still read back as the same double, which
 	is what CPython's repr produces.*/
@@ -485,24 +600,135 @@ static char *pystr_double(double d)
 	the precision it was given, which made str(1e3) come out as "1e+03".*/
 	const char *e = strchr(sci, 'e');
 	int exp = e ? atoi(e + 1) : 0;
-	if (exp < -4 || exp >= 16)
-		return ssprintf("%s", sci);
+	if (exp < -4 || exp >= 16) {
+		sputs(b, sci);
+		return;
+	}
 
 	int decimals = sig - 1 - exp;
 	if (decimals < 0)
 		decimals = 0;
 	char out[64];
 	snprintf(out, sizeof out, "%.*f", decimals, d);
+	sputs(b, out);
 	if (!strchr(out, '.'))
-		return ssprintf("%s.0", out);   /*str() keeps an integral float's ".0"*/
-	return ssprintf("%s", out);
+		sputs(b, ".0");   /*str() keeps an integral float's ".0"*/
 }
 
-/*Status line*/
-
-static char *col(int code, const char *s)
+/*Append str() of a scalar; 0, appending nothing, for a container or null.
+Matching Python's repr() for a list or dict is out of proportion for a field the
+payload sends as a string.*/
+static int sput_pystr(sbuf *b, const jval *v)
 {
-	return ssprintf("\033[%dm%s" RESET, code, s);
+	switch (v->type) {
+	case JSTR:
+		sputs(b, v->str);
+		return 1;
+	case JNUM:
+		/*Python's int has no ceiling, so str() of one is the literal itself,
+		less the sign of "-0"; the double would lose digits past 2^53 and the
+		cast to long long was undefined past 2^63.*/
+		if (v->is_int)
+			sputs(b, strcmp(v->str, "-0") ? v->str : "0");
+		else
+			sput_pyfloat(b, v->num);
+		return 1;
+	case JBOOL:
+		sputs(b, v->truth ? "True" : "False");
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+//Status line
+
+static void sopen(sbuf *b, const char *code)
+{
+	sappf(b, "\033[%sm", code);
+}
+
+static void scol(sbuf *b, const char *code, const char *s)
+{
+	sopen(b, code);
+	sputs(b, s);
+	sputs(b, RESET);
+}
+
+/*Separator before every segment but the first; np counts segments so far.*/
+static void part(sbuf *b, int *np)
+{
+	if ((*np)++)
+		scol(b, "90", " │ ");   // │
+}
+
+/*float(s) for a str, 1 on success.
+
+Matches CPython's float_from_string_inner() in Objects/floatobject.c and
+_Py_string_to_number_with_underscores() in Python/pystrtod.c, with each rule
+below checked against 3.12.3 and 3.14.2, which agree, rather than read off the
+source: surrounding whitespace is stripped (exactly C's isspace() set -- "\x1c"
+is not), then the rest must be a decimal literal or inf/infinity/nan in any
+case, each with an optional sign. An underscore is allowed only between two
+digits and is dropped before conversion, so "1e1_0" is 1e10 but "1_.5" and
+"1__0" fail.
+
+strtod() alone is wrong in both directions: it accepts hex floats ("0x10") and
+"nan(...)", and stops at an underscore. It keeps the sign of "-nan" too, which
+printf shows and Python's formatting does not, so a NaN is returned unsigned.
+
+Not handled: the non-ASCII digits that float() also takes ("١٢" is 12.0), which
+would need the string decoded from UTF-8 first.*/
+static int pyfloat(const char *s, double *out)
+{
+	while (isspace((unsigned char)*s))
+		s++;
+	size_t n = strlen(s);
+	while (n > 0 && isspace((unsigned char)s[n - 1]))
+		n--;
+
+	sbuf b = { NULL, 0, 0 };
+	sput(&b, "", 0);
+	int ok = 1;
+	for (size_t i = 0; i < n && ok; i++) {
+		if (s[i] != '_')
+			sput(&b, s + i, 1);
+		else if (i == 0 || i + 1 == n || !isdigit((unsigned char)s[i - 1])
+		         || !isdigit((unsigned char)s[i + 1]))
+			ok = 0;
+	}
+
+	const char *p = b.p;
+	if (*p == '+' || *p == '-')
+		p++;
+	if (ok && strcasecmp(p, "inf") && strcasecmp(p, "infinity") && strcasecmp(p, "nan")) {
+		int digits = 0;
+		for (; isdigit((unsigned char)*p); p++)
+			digits++;
+		if (*p == '.')
+			for (p++; isdigit((unsigned char)*p); p++)
+				digits++;
+		if (!digits)
+			ok = 0;
+		if (ok && (*p == 'e' || *p == 'E')) {
+			p++;
+			if (*p == '+' || *p == '-')
+				p++;
+			if (!isdigit((unsigned char)*p))
+				ok = 0;
+			while (isdigit((unsigned char)*p))
+				p++;
+		}
+		if (*p != '\0')
+			ok = 0;
+	}
+
+	if (ok) {
+		double d = strtod(b.p, NULL);
+		*out = isnan(d) ? NAN : d;
+	}
+	sfree(&b);
+	return ok;
 }
 
 /*float() of a percentage field; returns 0 if there is no number in it.
@@ -514,65 +740,75 @@ a displayed 100%, seen 2026-09-18 with the bar reading "5h 100%" while /usage
 reported 2%. A fraction-encoded 2% would have arrived as 0.02 and displayed
 correctly, so the fraction case does not occur -- the guess could only ever
 misfire, never help.*/
-static int pct(const jval *v, double *out)
+static int pct(const jval *o, double *out)
 {
-	double d;
-	if (!jnum(v, &d)) {
-		if (v->type != JSTR)
-			return 0;
-		/*float("45") succeeds in Python, so a numeric string is accepted here too.*/
-		char *end;
-		d = strtod(v->str, &end);
-		if (end == v->str)
-			return 0;
-		while (isspace((unsigned char)*end))
-			end++;
-		if (*end != '\0')
-			return 0;
-	}
-	*out = d;
-	return 1;
+	if (jnum(o, out))
+		return 1;
+	/*float("45") succeeds in Python, so a numeric string is accepted too.*/
+	const char *s = jstr(o);
+	return s && pyfloat(s, out);
 }
 
-/*Green under 60%, yellow from 60%, red from 80%.*/
-static int colour_for(double p)
+//Green under 60%, yellow from 60%, red from 80%
+static const char *colour_for(double p)
 {
-	return p < 60 ? 32 : (p < 80 ? 33 : 31);
+	return p < 60 ? "32" : (p < 80 ? "33" : "31");
 }
 
 #define BAR_FULL  "▰"   // ▰
 #define BAR_EMPTY "▱"   // ▱
+#define BAR_WIDTH 10
 
-static char *bar(double p)
+/*Cells a percentage fills, 0..BAR_WIDTH.
+
+rint() rounds half to even under the default mode, as Python's round() does.
+The clamp comes before the cast because a double past INT_MAX does not convert,
+and a NaN, which Python would raise on, pins to empty.*/
+static int cells(double p)
 {
-	const int width = 10;
-	/*rint() rounds half to even under the default mode, as Python's round() does.*/
-	int filled = (int)rint(p / 100 * width);
-	if (filled < 0)
-		filled = 0;
-	if (filled > width)
-		filled = width;
-
-	sbuf f = { NULL, 0, 0 }, e = { NULL, 0, 0 };
-	sput(&f, "", 0);
-	sput(&e, "", 0);
-	for (int i = 0; i < filled; i++)
-		sput(&f, BAR_FULL, strlen(BAR_FULL));
-	for (int i = 0; i < width - filled; i++)
-		sput(&e, BAR_EMPTY, strlen(BAR_EMPTY));
-
-	char *a = col(colour_for(p), f.p);
-	char *b = col(90, e.p);
-	return ssprintf("%s%s", a, b);
+	double c = rint(p / 100 * BAR_WIDTH);
+	if (!(c > 0))
+		return 0;
+	return c > BAR_WIDTH ? BAR_WIDTH : (int)c;
 }
 
-static char *human(long long n)
+/*A coloured run of n copies of cell, closed even when n is 0, as the Python's
+c(code, "") is.*/
+static void srun(sbuf *b, const char *code, const char *cell, int n)
 {
+	sopen(b, code);
+	for (int i = 0; i < n; i++)
+		sputs(b, cell);
+	sputs(b, RESET);
+}
+
+static void bar(sbuf *b, double p)
+{
+	int filled = cells(p);
+	srun(b, colour_for(p), BAR_FULL, filled);
+	srun(b, "90", BAR_EMPTY, BAR_WIDTH - filled);
+}
+
+/*Append human(int(d)).
+
+Kept in double because Python's int() is unbounded: a cast to long long is
+undefined past 2^63, and printed 1e20 tokens as -9223372036854775808 where the
+Python gives "100000000000000.0M". trunc() is int()'s rounding toward zero, and
+adding 0.0 turns the -0.0 it leaves for (-1, 0) into the "0" that str(int)
+prints. The quotients match Python's correctly rounded int/int division, since
+an integral double divided by an exact power of ten is rounded once. The one
+gap is an integer token count past 2^53, which the parser has already rounded to a
+double before it gets here. Infinity and NaN reach this only on payloads where
+Python's int() raises.*/
+static void human(sbuf *b, double d)
+{
+	double n = trunc(d) + 0.0;
 	if (n >= 1000000)
-		return ssprintf("%.1fM", (double)n / 1000000.0);
-	if (n >= 1000)
-		return ssprintf("%.0fk", (double)n / 1000.0);
-	return ssprintf("%lld", n);
+		sappf(b, "%.1fM", n / 1000000.0);
+	else if (n >= 1000)
+		sappf(b, "%.0fk", n / 1000.0);
+	else
+		sappf(b, "%.0f", n);
 }
 
 /*Read exactly `width` ASCII digits, advancing the cursor; 0 if they are not there.
@@ -593,23 +829,52 @@ static int read_digits(const char **p, int width, int *out)
 	return 1;
 }
 
+/*Read an optional [.,]digits fraction as microseconds, 0 if it is malformed.
+
+As parse_hh_mm_ss_ff() in CPython 3.14.2 Modules/_datetimemodule.c does it: the
+first six digits are kept, a shorter run is scaled up (".5" is 500000), and any
+further digits are skipped, not rounded. The digits may be absent only when
+something follows, which is the quirk described under "fraction" below.*/
+static int read_fraction(const char **p, long *us)
+{
+	*us = 0;
+	if (**p != '.' && **p != ',')
+		return 1;
+	(*p)++;
+	int digits = 0;
+	for (; isdigit((unsigned char)**p); (*p)++)
+		if (digits++ < 6)
+			*us = *us * 10 + (**p - '0');
+	for (int i = digits; i < 6; i++)
+		*us *= 10;
+	return digits || **p != '\0';
+}
+
 /*Parse an ISO-8601 timestamp to a Unix time, 1 on success.
 
-Accepts what datetime.fromisoformat() does on CPython 3.12, since the Python
+Accepts what datetime.fromisoformat() does on CPython 3.14, since the Python
 this replaces hands it whatever the payload carries and shows nothing when it
-raises. Each rule below was checked against 3.12.3 rather than read off the
-grammar, because several are quirks rather than ISO:
+raises; 3.14 is what `python3` runs statusline.py under on this machine. Each
+rule below was checked against 3.14.2 rather than read off the grammar, because
+several are quirks rather than ISO. Where 3.12.3 differs, that is noted:
 
   date      YYYY-MM-DD or YYYYMMDD, never half-separated ("2027-0101" raises)
   time      HH, HH:MM, HH:MM:SS, HHMM, HHMMSS -- colons all-or-nothing within
             the time, but independent of the date's dashes ("20270101T05:30:15"
-            parses)
-  fraction  [.,] then digits; dropped here, as the output is whole minutes. A
-            bare "." at end of string raises, yet "15.+02:00" parses, so the
-            digits are only required when nothing follows
-  offset    +/-HH[:MM[:SS]], basic or extended, and rejected when the total
-            reaches 24h -- the fields themselves are unchecked, so "+02:60"
-            parses as +03:00
+            parses). Hour 24 is midnight of the next day, allowed only with
+            minutes, seconds and fraction all zero ("T24", "T24:00:00.0");
+            3.12 rejects every hour 24
+  fraction  [.,] then digits, only straight after the seconds, kept to the
+            microsecond as datetime keeps it. A bare "." at end of string
+            raises, yet "15.+02:00" parses, so the digits are only required
+            when nothing follows. 3.12 also takes a fraction after the hour or
+            minute ("T05.5", "T05:30.5")
+  offset    +/-HH[:MM[:SS]], basic or extended, then a fraction under the same
+            rules ("+01:00:00.5" parses, "+01.5" does not in 3.14 but does in
+            3.12), and rejected when the total reaches 24h -- the fields
+            themselves are unchecked, so "+02:60" parses as +03:00. CPython
+            reads the offset with the same routine as the time, which is where
+            all of this comes from
   naive     read as UTC, matching the tz-less branch in the Python
 
 "Z" is not handled here: the caller's str.replace("Z", "+00:00") runs first, as
@@ -617,10 +882,11 @@ in the Python, which is also why a lowercase "z" is rejected.
 
 Not accepted, and not emitted by the status-line payload: ordinal and week
 dates (2026-W01-1).*/
-static int parse_iso8601(const char *s, time_t *out)
+static int parse_iso8601(const char *s, double *out)
 {
 	const char *p = s;
 	int y, mo, d, h = 0, mi = 0, se = 0;
+	long us = 0;   // microseconds
 
 	/*Date. The dashes are all-or-nothing.*/
 	if (!read_digits(&p, 4, &y))
@@ -635,12 +901,13 @@ static int parse_iso8601(const char *s, time_t *out)
 	if (!read_digits(&p, 2, &d))
 		return 0;
 
-	long off = 0;
+	int64_t off = 0;   // UTC offset in microseconds
 	if (*p == 'T' || *p == 't' || *p == ' ') {
 		p++;
 		if (!read_digits(&p, 2, &h))
 			return 0;
 		int colon = (*p == ':');
+		int secs = 0;   // 1 = a seconds field was read, so a fraction may follow
 		if (colon)
 			p++;
 		if (isdigit((unsigned char)*p)) {
@@ -651,25 +918,21 @@ static int parse_iso8601(const char *s, time_t *out)
 					p++;
 					if (!read_digits(&p, 2, &se))
 						return 0;
+					secs = 1;
 				}
 			} else if (isdigit((unsigned char)*p)) {
 				if (!read_digits(&p, 2, &se))
 					return 0;
+				secs = 1;
 			}
 		} else if (colon) {
 			return 0;   /*"05:" with no minutes*/
 		}
 
-		if (*p == '.' || *p == ',') {
-			p++;
-			int digits = 0;
-			while (isdigit((unsigned char)*p)) {
-				p++;
-				digits++;
-			}
-			if (!digits && *p == '\0')
-				return 0;
-		}
+		/*A fraction anywhere else is left unread, and the final check on *p
+		rejects it.*/
+		if (secs && !read_fraction(&p, &us))
+			return 0;
 
 		if (*p == '+' || *p == '-') {
 			int sign = (*p == '-') ? -1 : 1;
@@ -678,6 +941,7 @@ static int parse_iso8601(const char *s, time_t *out)
 			if (!read_digits(&p, 2, &oh))
 				return 0;
 			int ocolon = (*p == ':');
+			int osecs = 0;   // 1 = the offset has a seconds field
 			if (ocolon)
 				p++;
 			if (isdigit((unsigned char)*p)) {
@@ -688,22 +952,32 @@ static int parse_iso8601(const char *s, time_t *out)
 						p++;
 						if (!read_digits(&p, 2, &os))
 							return 0;
+						osecs = 1;
 					}
 				} else if (isdigit((unsigned char)*p)) {
 					if (!read_digits(&p, 2, &os))
 						return 0;
+					osecs = 1;
 				}
 			} else if (ocolon) {
 				return 0;
 			}
-			long total = oh * 3600L + om * 60L + os;
-			if (total >= 24 * 3600L)
+			long ous = 0;
+			if (osecs && !read_fraction(&p, &ous))
+				return 0;
+			int64_t total = (oh * 3600LL + om * 60LL + os) * 1000000 + ous;
+			if (total >= 24 * 3600LL * 1000000)
 				return 0;
 			off = sign * total;
 		}
 	}
 	if (*p != '\0')
 		return 0;
+	/*Hour 24 is checked as hour 0 of the same date and moved on a day at the
+	end, so the date itself is still validated.*/
+	int next_day = (h == 24 && mi == 0 && se == 0 && us == 0);
+	if (next_day)
+		h = 0;
 	if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 59)
 		return 0;
 
@@ -729,39 +1003,88 @@ static int parse_iso8601(const char *s, time_t *out)
 	    || back.tm_hour != h || back.tm_min != mi || back.tm_sec != se)
 		return 0;
 
-	*out = t - off;
+	/*Whole microseconds first, as timedelta.total_seconds() counts them, so the
+	one rounding is the final division.*/
+	*out = (double)(((int64_t)t + (next_day ? 86400 : 0)) * 1000000 + us - off) / 1e6;
 	return 1;
 }
 
-/*Time until an ISO-8601 reset timestamp, or NULL if past or unparseable.*/
-static char *resets_in(const jval *v)
+/*Unix time of a resets_at field, 1 on success.
+
+A number is a Unix time already, which is what the binary sends. A string is
+ISO-8601: str(ts).replace("Z", "+00:00"), as in the Python -- every "Z", not
+just a trailing one, which is why parse_iso8601() need not know about "Z".*/
+static int reset_time(const jval *o, double *out)
 {
-	const char *ts = jstr(v);
+	double n;
+	if (jnum(o, &n)) {
+		if (!isfinite(n))
+			return 0;
+		*out = n;
+		return 1;
+	}
+	const char *ts = jstr(o);
 	if (!ts || !*ts)
-		return NULL;
-	/*str(ts).replace("Z", "+00:00"), as in the Python -- every "Z", not just a
-	trailing one, which is why parse_iso8601() need not know about "Z" at all.*/
+		return 0;
+
 	sbuf z = { NULL, 0, 0 };
-	sput(&z, "", 0);
 	for (const char *q = ts; *q; q++) {
 		if (*q == 'Z')
 			sput(&z, "+00:00", 6);
 		else
 			sput(&z, q, 1);
 	}
+	int ok = parse_iso8601(z.p, out);
+	sfree(&z);
+	return ok;
+}
 
-	time_t t;
-	if (!parse_iso8601(z.p, &t))
-		return NULL;
-	double hours = difftime(t, time(NULL)) / 3600.0;
-	if (hours <= 0)
-		return NULL;
-	return hours >= 1 ? ssprintf("%.0fh", hours) : ssprintf("%.0fm", hours * 60);
+/*Offset from UTC in seconds of RESET_TZ at Unix time t, 1 on success. The
+floor matches datetime.fromtimestamp(), which looks up the whole second.*/
+static int utcoffset(double t, long *out)
+{
+	time_t tt = (time_t)floor(t);
+	struct tm tm;
+	if (!localtime_r(&tt, &tm))
+		return 0;
+	*out = tm.tm_gmtoff;
+	return 1;
+}
+
+/*Percent of the weekly window ending at `end` that has elapsed by `now`, 1 on
+success; 0 once the reset has passed.
+
+The window opens at the same Chicago wall-clock time a week earlier: a week of
+seconds back, then corrected by however far the zone's offset moved in between.
+That is exact for a 07:00 anchor, which is never within an hour of a Chicago
+transition; token.rationing.c has the sweep of which anchors are safe.*/
+static int week_elapsed(double end, double now, double *out)
+{
+	long o_end, o_start;
+	if (end <= now || !(end < YEAR_10000))
+		return 0;
+	if (!utcoffset(end, &o_end) || !utcoffset(end - WEEK, &o_start))
+		return 0;
+	double start = end - WEEK + (double)o_end - (double)o_start;
+	double p = (now - start) / (end - start) * 100;
+	*out = p < 0 ? 0 : (p > 100 ? 100 : p);
+	return 1;
+}
+
+/*time.time(), or STATUSLINE_NOW when the test sets it.*/
+static double now_unix(void)
+{
+	const char *s = getenv("STATUSLINE_NOW");
+	if (s && *s)
+		return strtod(s, NULL);
+	struct timespec ts;
+	if (!timespec_get(&ts, TIME_UTC))
+		return (double)time(NULL);
+	return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
 int main(void)
 {
-	/*Slurp stdin.*/
 	sbuf in = { NULL, 0, 0 };
 	sput(&in, "", 0);
 	char chunk[4096];
@@ -770,8 +1093,17 @@ int main(void)
 		sput(&in, chunk, got);
 
 	jval *d = jparse(in.p);
+	sfree(&in);
 
-	char *parts[8];
+	double now = now_unix();
+	/*Pin the zone for utcoffset(): the reset is Chicago wall-clock, whatever TZ
+	the caller has. Nothing else here reads local time. If it cannot be set the
+	on-pace budget is left out rather than worked out in the wrong zone.*/
+	int tz_ok = setenv("TZ", RESET_TZ, 1) == 0;
+	tzset();
+
+	sbuf out = { NULL, 0, 0 };
+	sput(&out, "", 0);
 	int np = 0;
 
 	/*A display_name that is not a string yields no segment here. The Python
@@ -779,33 +1111,26 @@ int main(void)
 	blank segment is the better failure for something drawn every render.*/
 	const char *model = jstr(jget(jget(d, "model"), "display_name"));
 	if (model && *model) {
-		const char *tags[2];
+		sbuf label = { NULL, 0, 0 };
 		int nt = 0;
-		if (jtruthy(jget(d, "fast_mode")))
-			tags[nt++] = "fast";
-		/*str(level). A container would need Python's repr() to match, which is
-		out of proportion for a field the payload sends as a string, so only
-		scalars are rendered and a list or dict shows no tag.*/
+		sputs(&label, model);
+		if (jtruthy(jget(d, "fast_mode"))) {
+			sputs(&label, " fast");
+			nt++;
+		}
 		jval *lvl = jget(jget(d, "effort"), "level");
-		const char *lvls = NULL;   /*one branch assigns a string literal*/
-		if (lvl->type == JSTR && lvl->str[0])
-			lvls = lvl->str;
-		else if (lvl->type == JNUM)
-			lvls = lvl->is_int ? ssprintf("%lld", (long long)lvl->num)
-			                   : pystr_double(lvl->num);
-		else if (lvl->type == JBOOL && lvl->truth)
-			lvls = "True";   /*str(True); false is falsy and tags nothing*/
-		if (lvls)
-			tags[nt++] = lvls;
-
-		char *label;
-		if (nt == 2)
-			label = ssprintf("%s %s/%s", model, tags[0], tags[1]);
-		else if (nt == 1)
-			label = ssprintf("%s %s", model, tags[0]);
-		else
-			label = ssprintf("%s", model);
-		parts[np++] = col(36, label);
+		if (jtruthy(lvl)) {
+			sbuf s = { NULL, 0, 0 };
+			sput(&s, "", 0);
+			if (sput_pystr(&s, lvl)) {
+				sputs(&label, nt ? "/" : " ");
+				sputs(&label, s.p);
+			}
+			sfree(&s);
+		}
+		part(&out, &np);
+		scol(&out, "36", label.p);
+		sfree(&label);
 	}
 
 	jval *cw = jget(d, "context_window");
@@ -813,10 +1138,16 @@ int main(void)
 	if (jnum(jget(cw, "total_input_tokens"), &used)
 	    && jnum(jget(cw, "context_window_size"), &size) && size != 0) {
 		double p = used / size * 100;
-		char *b = bar(p);
-		char *ppct = col(colour_for(p), ssprintf("%.0f%%", p));
-		char *counts = col(90, ssprintf("%s/%s", human((long long)used), human((long long)size)));
-		parts[np++] = ssprintf("%s %s %s", b, ppct, counts);
+		part(&out, &np);
+		bar(&out, p);
+		sputs(&out, " ");
+		sopen(&out, colour_for(p));
+		sappf(&out, "%.0f%%" RESET " ", p);
+		sopen(&out, "90");
+		human(&out, used);
+		sputs(&out, "/");
+		human(&out, size);
+		sputs(&out, RESET);
 	}
 
 	jval *rl = jget(d, "rate_limits");
@@ -829,15 +1160,37 @@ int main(void)
 		double p;
 		if (!pct(jget(v, "used_percentage"), &p))
 			continue;
-		char *left = resets_in(jget(v, "resets_at"));
-		char *head = col(colour_for(p), ssprintf("%s %.0f%%", shorts[i], p));
-		parts[np++] = left ? ssprintf("%s%s", head, col(90, ssprintf("↺%s", left)))
-		                   : head;
+		double end = 0, sched = 0;   /*set only on success; zeroed for -Wmaybe-uninitialized*/
+		int have_end = reset_time(jget(v, "resets_at"), &end);
+		/*Only the weekly window is rationed.*/
+		int paced = tz_ok && have_end && strcmp(keys[i], "seven_day") == 0
+		    && week_elapsed(end, now, &sched);
+		/*Red when spending ahead of the ration, whatever the absolute level.*/
+		const char *hue = paced && p > sched ? "31" : colour_for(p);
+
+		part(&out, &np);
+		sopen(&out, hue);
+		sappf(&out, "%s %.0f%%", shorts[i], p);
+		if (paced)
+			sappf(&out, "/%.1f%%", sched);
+		sputs(&out, RESET);
+
+		double hours = have_end ? (end - now) / 3600 : 0;
+		if (hours > 0) {
+			sopen(&out, "90");
+			if (hours >= 1)
+				sappf(&out, "↺%.0fh" RESET, hours);
+			else
+				sappf(&out, "↺%.0fm" RESET, hours * 60);
+		}
 	}
 
 	double cost;
-	if (jnum(jget(jget(d, "cost"), "total_cost_usd"), &cost) && cost > 0)
-		parts[np++] = col(90, ssprintf("$%.2f", cost));
+	if (jnum(jget(jget(d, "cost"), "total_cost_usd"), &cost) && cost > 0) {
+		part(&out, &np);
+		sopen(&out, "90");
+		sappf(&out, "$%.2f" RESET, cost);
+	}
 
 	const char *cwd = jstr(jget(jget(d, "workspace"), "current_dir"));
 	if (!cwd || !*cwd)
@@ -850,15 +1203,15 @@ int main(void)
 		size_t start = len;
 		while (start > 0 && cwd[start - 1] != '/')
 			start--;
-		parts[np++] = col(35, ssprintf("%.*s", (int)(len - start), cwd + start));
+		part(&out, &np);
+		sopen(&out, "35");
+		sput(&out, cwd + start, len - start);
+		sputs(&out, RESET);
 	}
 
-	char *sep = col(90, " │ ");   // │
-	for (int i = 0; i < np; i++) {
-		if (i)
-			fputs(sep, stdout);
-		fputs(parts[i], stdout);
-	}
-	putchar('\n');
+	sputs(&out, "\n");
+	fputs(out.p, stdout);
+	sfree(&out);
+	jfree(d);
 	return 0;
 }

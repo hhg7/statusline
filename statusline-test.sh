@@ -15,8 +15,14 @@
 # STATUSLINE_BIN picks which build to check; it defaults to ./statusline, the
 # json-c one. Point it at a build of statusline-nodeps.c to check that fallback,
 # which is not otherwise covered.
+#
+# STATUSLINE_NOW is fixed once for the whole run, so the Python, the C and the
+# generated timestamps all read one clock; before it, a reset 11.5h out could
+# round to 11h in one process and 12h in the next. statusline-test-pace.py then
+# checks the ration bar against hand-worked windows on fixed clocks of its own.
 set -u
 cd "$(dirname "$0")" || exit 1
+export STATUSLINE_NOW=${STATUSLINE_NOW:-$(python3 -c 'import time; print(repr(time.time()))')}
 PY=./statusline.py
 C=${STATUSLINE_BIN:-./statusline}
 FUZZ=${1:-3000}
@@ -37,22 +43,9 @@ while IFS= read -r line; do
 	[ -n "$line" ] && check "$line"
 done < <(python3 statusline-test-cases.py)
 
-# Resets a whole number of seconds away, landing on a half-hour or half-minute,
-# stamped immediately before each run. The true interval is then a few
-# milliseconds under x.5, which Python rounds down; a C that read the clock in
-# whole seconds saw exactly x.5 whenever it ran in the stamp's second and
-# rounded half to even, so "11h" came out "12h". Generated here rather than in
-# statusline-test-cases.py because those are all stamped up front, and are a
-# second stale by the time they run.
-for i in 1 2 3 4 5; do
-	for off in 41400 9000 1770; do   # 11.5h, 2.5h, 29.5m
-		ts=$(date -u -d "@$(( $(date +%s) + off ))" +%Y-%m-%dT%H:%M:%SZ)
-		check '{"rate_limits":{"five_hour":{"used_percentage":5,"resets_at":"'"$ts"'"}}}'
-	done
-done
-
 STATUSLINE_BIN=$C python3 statusline-test-fuzz.py "$FUZZ" || bad=$((bad + 1))
 STATUSLINE_BIN=$C python3 statusline-test-floats.py || bad=$((bad + 1))
+STATUSLINE_BIN=$C python3 statusline-test-pace.py || bad=$((bad + 1))
 
 printf '%s: %d curated cases, %d mismatches (plus the %d-payload fuzz above)\n' "$C" "$tot" "$bad" "$FUZZ"
 [ "$bad" -eq 0 ]

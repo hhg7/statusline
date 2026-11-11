@@ -18,11 +18,11 @@ ifeq ($(strip $(JSONC_LIBS)),)
 JSONC_LIBS := -ljson-c
 endif
 
-# -lm is for rint(), trunc() and isnan() in bar(), human(), pyfloat() and
-# pystr_double().
+# -lm is for rint(), trunc(), floor() and isnan() in cells(), human(), pyfloat(),
+# utcoffset() and sput_pyfloat().
 LIBM := -lm
 
-.PHONY: all nodeps test test-nodeps install install-nodeps uninstall clean
+.PHONY: all nodeps test test-nodeps valgrind valgrind-nodeps install install-nodeps uninstall clean
 
 all: statusline
 
@@ -40,6 +40,13 @@ test: statusline
 
 test-nodeps: statusline-nodeps
 	STATUSLINE_BIN=./statusline-nodeps ./statusline-test.sh $(FUZZ)
+
+# Every curated payload under valgrind; fails on any leak or memory error.
+valgrind: statusline
+	./statusline-test-valgrind.sh
+
+valgrind-nodeps: statusline-nodeps
+	STATUSLINE_BIN=./statusline-nodeps ./statusline-test-valgrind.sh
 
 install: statusline
 	mkdir -p $(CLAUDE_DIR)
